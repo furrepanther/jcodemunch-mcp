@@ -778,6 +778,29 @@ def _extract_constant(
                     content_hash=c_hash,
                 )
 
+    # GDScript: const MAX_SPEED: float = 100.0  (all const declarations are constants)
+    if node.type == "const_statement":
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            name = source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8")
+            sig = source_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
+            const_bytes = source_bytes[node.start_byte:node.end_byte]
+            c_hash = compute_content_hash(const_bytes)
+            return Symbol(
+                id=make_symbol_id(filename, name, "constant"),
+                file=filename,
+                name=name,
+                qualified_name=name,
+                kind="constant",
+                language=language,
+                signature=sig[:100],
+                line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                byte_offset=node.start_byte,
+                byte_length=node.end_byte - node.start_byte,
+                content_hash=c_hash,
+            )
+
     # Perl: use constant NAME => value
     if node.type == "use_statement":
         children = list(node.children)

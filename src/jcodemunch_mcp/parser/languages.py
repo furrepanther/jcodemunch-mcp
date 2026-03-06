@@ -78,6 +78,7 @@ LANGUAGE_EXTENSIONS = {
     ".pl": "perl",
     ".pm": "perl",
     ".t": "perl",
+    ".gd": "gdscript",
 }
 
 
@@ -542,6 +543,40 @@ RUBY_SPEC = LanguageSpec(
 )
 
 
+# GDScript specification (Godot 4)
+# GDScript is Python-like; tree-sitter-gdscript exposes named fields
+# for name, parameters, and return_type on function_definition nodes.
+# Annotations (@export, @onready, @tool) appear as preceding `annotation`
+# siblings before the declaration they decorate.
+GDSCRIPT_SPEC = LanguageSpec(
+    ts_language="gdscript",
+    symbol_node_types={
+        "function_definition": "function",
+        "class_definition": "class",
+        "signal_statement": "function",
+        "enum_definition": "type",
+    },
+    name_fields={
+        "function_definition": "name",
+        "class_definition": "name",
+        "signal_statement": "name",
+        "enum_definition": "name",
+    },
+    param_fields={
+        "function_definition": "parameters",
+        "signal_statement": "parameters",
+    },
+    return_type_fields={
+        "function_definition": "return_type",
+    },
+    docstring_strategy="preceding_comment",
+    decorator_node_type="annotation",
+    container_node_types=["class_definition"],
+    constant_patterns=["const_statement"],
+    type_patterns=["enum_definition"],
+)
+
+
 # Language registry
 LANGUAGE_REGISTRY = {
     "python": PYTHON_SPEC,
@@ -559,6 +594,7 @@ LANGUAGE_REGISTRY = {
     "elixir": ELIXIR_SPEC,
     "ruby": RUBY_SPEC,
     "perl": PERL_SPEC,
+    "gdscript": GDSCRIPT_SPEC,
 }
 
 logger = logging.getLogger(__name__)
