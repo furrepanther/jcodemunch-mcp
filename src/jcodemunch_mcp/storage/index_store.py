@@ -174,7 +174,11 @@ class IndexStore:
         return self.base_path / self._repo_slug(owner, name)
 
     def _safe_content_path(self, content_dir: Path, relative_path: str) -> Optional[Path]:
-        """Resolve a content path and ensure it stays within content_dir."""
+        """Resolve a content path and ensure it stays within content_dir.
+
+        Prevents path traversal when writing/reading cached raw files from
+        untrusted repository paths.
+        """
         try:
             base = content_dir.resolve()
             candidate = (content_dir / relative_path).resolve()
