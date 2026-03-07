@@ -148,7 +148,49 @@ jcodemunch-mcp --help
 > - **macOS:** `/Users/<username>/.local/bin/jcodemunch-mcp`
 > - **Windows:** `C:\\Users\\<username>\\AppData\\Roaming\\Python\\Python3xx\\Scripts\\jcodemunch-mcp.exe`
 
-### Claude Desktop / Claude Code
+### Claude Code
+
+The fastest way to add jCodeMunch to Claude Code is a single command:
+
+```bash
+claude mcp add jcodemunch uvx jcodemunch-mcp
+```
+
+This registers the server at user scope (`~/.claude.json`) so it is available in every project. To add it to a specific project only, pass `--scope project`:
+
+```bash
+claude mcp add --scope project jcodemunch uvx jcodemunch-mcp
+```
+
+To include optional environment variables (e.g. `GITHUB_TOKEN` or `ANTHROPIC_API_KEY`):
+
+```bash
+claude mcp add jcodemunch uvx jcodemunch-mcp \
+  -e GITHUB_TOKEN=ghp_... \
+  -e ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Restart Claude Code after adding the server.
+
+**Manual config** — if you prefer to edit the config file directly, the relevant files are:
+
+| Scope   | Path |
+| ------- | ---- |
+| User (global) | `~/.claude.json` |
+| Project | `.claude/settings.json` (in the project root) |
+
+```json
+{
+  "mcpServers": {
+    "jcodemunch": {
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"]
+    }
+  }
+}
+```
+
+### Claude Desktop
 
 Config file location:
 
@@ -207,7 +249,7 @@ Config file location:
 
 > Logging flags can also be set via env vars `JCODEMUNCH_LOG_LEVEL` and `JCODEMUNCH_LOG_FILE`. Always use `--log-file` (or the env var) when debugging — writing logs to stderr can corrupt the MCP stdio stream in some clients.
 
-After saving the config, **restart Claude Desktop / Claude Code** for the server to appear.
+After saving the config, **restart Claude Desktop** for the server to appear.
 
 ### Google Antigravity
 

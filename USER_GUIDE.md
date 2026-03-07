@@ -3,8 +3,16 @@
 ## Installation
 
 ```bash
-pip install git+https://github.com/jgravelle/jcodemunch-mcp.git
+pip install jcodemunch-mcp
 ```
+
+Verify:
+
+```bash
+jcodemunch-mcp --help
+```
+
+> **Recommended:** use [`uvx`](https://github.com/astral-sh/uv) instead of `pip install` when configuring MCP clients. `uvx` runs the package on demand without requiring it to be on your system PATH.
 
 Or from source:
 
@@ -18,15 +26,43 @@ pip install -e .
 
 ## Configuration
 
-### Claude Desktop
+### Claude Code
 
-Add to your `claude_desktop_config.json`:
+The fastest way to add jCodeMunch to Claude Code is a single command:
+
+```bash
+claude mcp add jcodemunch uvx jcodemunch-mcp
+```
+
+This registers the server at user scope (`~/.claude.json`) so it is available in every project. To limit it to a single project, pass `--scope project`:
+
+```bash
+claude mcp add --scope project jcodemunch uvx jcodemunch-mcp
+```
+
+To include optional environment variables at the same time:
+
+```bash
+claude mcp add jcodemunch uvx jcodemunch-mcp \
+  -e GITHUB_TOKEN=ghp_xxxxxxxx \
+  -e ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
+```
+
+Restart Claude Code after running the command.
+
+**Manual config** — if you prefer to edit the config file directly:
+
+| Scope   | Path |
+| ------- | ---- |
+| User (global) | `~/.claude.json` |
+| Project | `.claude/settings.json` (in the project root) |
 
 ```json
 {
   "mcpServers": {
     "jcodemunch": {
-      "command": "jcodemunch-mcp",
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"],
       "env": {
         "GITHUB_TOKEN": "ghp_xxxxxxxx",
         "ANTHROPIC_API_KEY": "sk-ant-xxxxxxxx"
@@ -36,12 +72,43 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-Both environment variables are optional:
+Environment variables are optional — see the table below.
+
+### Claude Desktop
+
+Config file location:
+
+| OS      | Path |
+| ------- | ---- |
+| macOS   | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Linux   | `~/.config/claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "jcodemunch": {
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_xxxxxxxx",
+        "ANTHROPIC_API_KEY": "sk-ant-xxxxxxxx"
+      }
+    }
+  }
+}
+```
+
+Environment variables are optional:
 
 * `GITHUB_TOKEN` enables private repositories and higher GitHub API rate limits.
 * `ANTHROPIC_API_KEY` enables AI-generated summaries via Claude Haiku.
 * `GOOGLE_API_KEY` enables AI-generated summaries via Gemini Flash (used if `ANTHROPIC_API_KEY` is not set).
 * If neither key is set, summaries fall back to docstrings or signatures.
+
+Restart Claude Desktop after saving the config.
 
 ### VS Code
 
@@ -51,7 +118,8 @@ Add to `.vscode/settings.json`:
 {
   "mcp.servers": {
     "jcodemunch": {
-      "command": "jcodemunch-mcp",
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"],
       "env": {
         "GITHUB_TOKEN": "ghp_xxxxxxxx"
       }
@@ -96,7 +164,8 @@ if (total > 0) output += ` │ ${total.toLocaleString()} tkns saved · $${cost} 
 {
   "mcpServers": {
     "jcodemunch": {
-      "command": "jcodemunch-mcp",
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"],
       "env": {
         "GITHUB_TOKEN": "ghp_xxxxxxxx",
         "ANTHROPIC_API_KEY": "sk-ant-xxxxxxxx"
@@ -105,10 +174,6 @@ if (total > 0) output += ` │ ${total.toLocaleString()} tkns saved · $${cost} 
   }
 }
 ```
-
----
-
-## Workflows
 
 ### Explore a New Repository
 
@@ -227,7 +292,8 @@ To disable, set `JCODEMUNCH_SHARE_SAVINGS=0` in your MCP server env:
 {
   "mcpServers": {
     "jcodemunch": {
-      "command": "jcodemunch-mcp",
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"],
       "env": {
         "JCODEMUNCH_SHARE_SAVINGS": "0"
       }
