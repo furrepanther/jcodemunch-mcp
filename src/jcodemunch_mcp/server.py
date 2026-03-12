@@ -286,7 +286,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_text",
-            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values).",
+            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values). Supports regex (is_regex=true) and context lines around matches (context_lines=N, like grep -C).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -296,7 +296,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "query": {
                         "type": "string",
-                        "description": "Text to search for (case-insensitive substring match)"
+                        "description": "Text to search for. Case-insensitive substring by default. Set is_regex=true for full regex (e.g. 'estimateToken|tokenEstimat|\\.length.*0\\.25')."
+                    },
+                    "is_regex": {
+                        "type": "boolean",
+                        "description": "When true, treat query as a Python regex (re.search, case-insensitive). Supports alternation (|), character classes, lookaheads, etc.",
+                        "default": False
                     },
                     "file_pattern": {
                         "type": "string",
@@ -309,7 +314,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "context_lines": {
                         "type": "integer",
-                        "description": "Number of surrounding lines to include before/after each match",
+                        "description": "Lines of context to include before and after each match (like grep -C N). Essential for understanding code around matches.",
                         "default": 0
                     }
                 },
@@ -418,7 +423,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 functools.partial(
                     get_file_outline,
                     repo=arguments["repo"],
-                    file_path=arguments["file_path"],
+                    file_path=arguments.get("file_path") or arguments["file"],
                     storage_path=storage_path,
                 )
             )
@@ -483,6 +488,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     file_pattern=arguments.get("file_pattern"),
                     max_results=arguments.get("max_results", 20),
                     context_lines=arguments.get("context_lines", 0),
+                    is_regex=arguments.get("is_regex", False),
                     storage_path=storage_path,
                 )
             )

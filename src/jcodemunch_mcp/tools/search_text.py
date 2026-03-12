@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from typing import Optional
 
@@ -15,6 +16,7 @@ def search_text(
     file_pattern: Optional[str] = None,
     max_results: int = 20,
     context_lines: int = 0,
+    is_regex: bool = False,
     storage_path: Optional[str] = None,
 ) -> dict:
     """Search for text across all indexed files in a repository.
@@ -24,10 +26,12 @@ def search_text(
 
     Args:
         repo: Repository identifier (owner/repo or just repo name).
-        query: Text to search for (case-insensitive substring match).
+        query: Text to search for. Case-insensitive substring by default;
+               set is_regex=True for full regex (e.g. 'estimateToken|tokenEstimat').
         file_pattern: Optional glob pattern to filter files.
         max_results: Maximum number of matching lines to return.
-        context_lines: Number of surrounding lines to include before/after each match.
+        context_lines: Lines of context before/after each match (like grep -C).
+        is_regex: When True, treat query as a Python regex (re.search, IGNORECASE).
         storage_path: Custom storage path.
 
     Returns:
@@ -36,6 +40,12 @@ def search_text(
     start = time.perf_counter()
     max_results = max(1, min(max_results, 100))
     context_lines = max(0, min(context_lines, 10))
+
+    if is_regex:
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error as e:
+            return {"error": f"Invalid regex: {e}"}
 
     try:
         owner, name = resolve_repo(repo, storage_path)
@@ -55,7 +65,7 @@ def search_text(
         files = [f for f in files if fnmatch.fnmatch(f, file_pattern) or fnmatch.fnmatch(f, f"*/{file_pattern}")]
 
     content_dir = store._content_dir(owner, name)
-    query_lower = query.lower()
+    query_lower = query.lower() if not is_regex else None
     results = []
     result_count = 0
     files_searched = 0
@@ -80,7 +90,8 @@ def search_text(
         lines = content.split("\n")
         file_matches = []
         for line_index, line in enumerate(lines):
-            if query_lower in line.lower():
+            hit = pattern.search(line) if is_regex else (query_lower in line.lower())
+            if hit:
                 match = {
                     "line": line_index + 1,
                     "text": line.rstrip()[:200],  # Truncate long lines
@@ -112,6 +123,7 @@ def search_text(
     return {
         "repo": f"{owner}/{name}",
         "query": query,
+        "is_regex": is_regex,
         "context_lines": context_lines,
         "result_count": result_count,
         "results": results,

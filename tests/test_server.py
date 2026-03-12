@@ -71,6 +71,7 @@ async def test_search_text_tool_schema():
     assert "file_pattern" in props
     assert "max_results" in props
     assert "context_lines" in props
+    assert "is_regex" in props
 
 
 @pytest.mark.asyncio
@@ -130,6 +131,7 @@ async def test_call_tool_forwards_search_text_context_lines():
         file_pattern=None,
         max_results=20,
         context_lines=3,
+        is_regex=False,
         storage_path=None,
     )
 
