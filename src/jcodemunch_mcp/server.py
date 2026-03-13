@@ -27,6 +27,7 @@ from .tools.get_repo_outline import get_repo_outline
 from .tools.find_importers import find_importers
 from .tools.find_references import find_references
 from .tools.search_columns import search_columns
+from .tools.get_context_bundle import get_context_bundle
 
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,24 @@ async def list_tools() -> list[Tool]:
                 "required": ["repo", "query"]
             }
         ),
+        Tool(
+            name="get_context_bundle",
+            description="Get a context bundle for a symbol: its full definition plus all import/require statements from the same file. Gives an AI just enough context to understand and modify a symbol without loading the entire file. Use after identifying a symbol via search_symbols or get_file_outline.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)"
+                    },
+                    "symbol_id": {
+                        "type": "string",
+                        "description": "Symbol ID from get_file_outline or search_symbols"
+                    }
+                },
+                "required": ["repo", "symbol_id"]
+            }
+        ),
     ]
 
 
@@ -562,6 +581,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     query=arguments["query"],
                     model_pattern=arguments.get("model_pattern"),
                     max_results=arguments.get("max_results", 20),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_context_bundle":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_context_bundle,
+                    repo=arguments["repo"],
+                    symbol_id=arguments["symbol_id"],
                     storage_path=storage_path,
                 )
             )
