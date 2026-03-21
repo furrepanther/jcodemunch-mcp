@@ -1,5 +1,7 @@
 Quickstart - https://github.com/jgravelle/jcodemunch-mcp/blob/main/QUICKSTART.md
 
+<!-- mcp-name: io.github.jgravelle/jcodemunch-mcp -->
+
 ## FREE FOR PERSONAL USE
 **Use it to make money, and Uncle J. gets a taste. Fair enough?** [details](#commercial-licenses)
 
