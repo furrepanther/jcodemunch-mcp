@@ -29,6 +29,7 @@ from .tools.search_text import search_text
 from .tools.get_repo_outline import get_repo_outline
 from .tools.find_importers import find_importers
 from .tools.find_references import find_references
+from .tools.check_references import check_references
 from .tools.get_session_stats import get_session_stats
 from .tools.get_dependency_graph import get_dependency_graph
 from .tools.get_blast_radius import get_blast_radius
@@ -506,6 +507,30 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="check_references",
+            description="Check if an identifier is referenced anywhere: imports + file content. Combines find_references and search_text into one call. Returns is_referenced (bool) for quick dead-code detection. Accepts multiple identifiers in one call via identifiers param.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository identifier"},
+                    "identifier": {"type": "string", "description": "Single identifier to check"},
+                    "identifiers": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Multiple identifiers to check in one call. Returns grouped results.",
+                    },
+                    "search_content": {
+                        "type": "boolean", "default": True,
+                        "description": "Also search file contents (not just imports). Set false for fast import-only check.",
+                    },
+                    "max_content_results": {
+                        "type": "integer", "default": 20,
+                        "description": "Max content matches per identifier.",
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
             name="search_columns",
             description="Search column metadata across indexed models. Works with any ecosystem provider that emits column data (dbt, SQLMesh, database catalogs, etc.). Returns model name, file path, column name, and description. Use instead of grep/search_text for column discovery — 77% fewer tokens.",
             inputSchema={
@@ -861,6 +886,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     identifier=arguments.get("identifier"),
                     identifiers=arguments.get("identifiers"),
                     max_results=arguments.get("max_results", 50),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "check_references":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    check_references,
+                    repo=arguments["repo"],
+                    identifier=arguments.get("identifier"),
+                    identifiers=arguments.get("identifiers"),
+                    search_content=arguments.get("search_content", True),
+                    max_content_results=arguments.get("max_content_results", 20),
                     storage_path=storage_path,
                 )
             )

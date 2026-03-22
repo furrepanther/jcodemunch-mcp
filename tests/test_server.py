@@ -13,14 +13,14 @@ async def test_server_lists_all_tools():
     """Test that server lists all 18 tools."""
     tools = await list_tools()
 
-    assert len(tools) == 24
+    assert len(tools) == 25
 
     names = {t.name for t in tools}
     expected = {
         "index_repo", "index_folder", "index_file", "list_repos", "get_file_tree",
         "get_file_outline", "get_file_content", "get_symbol", "get_symbols",
         "search_symbols", "invalidate_cache", "search_text", "get_repo_outline",
-        "find_importers", "find_references", "search_columns", "get_context_bundle",
+        "find_importers", "find_references", "check_references", "search_columns", "get_context_bundle",
         "get_session_stats", "get_dependency_graph", "get_blast_radius",
         "get_symbol_diff", "get_class_hierarchy", "get_related_symbols", "suggest_queries",
     }
