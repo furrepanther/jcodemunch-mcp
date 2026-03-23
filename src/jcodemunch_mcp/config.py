@@ -93,13 +93,34 @@ def _strip_jsonc(text: str) -> str:
             result.append(ch)
             i += 1
         elif ch == '/' and i + 1 < n and text[i + 1] == '/':
-            # Line comment — skip to end of line
+            # Line comment — strip trailing comma and spaces from previous content
+            if result and result[-1] == ',':
+                result.pop()
+                while result and result[-1] in (' ', '\t'):
+                    result.pop()
             end = text.find('\n', i)
             i = n if end == -1 else end
         elif ch == '/' and i + 1 < n and text[i + 1] == '*':
             # Block comment — skip to */
             end = text.find('*/', i + 2)
-            i = n if end == -1 else end + 2
+            if end == -1:
+                i = n
+            else:
+                end_i = end + 2
+                if end_i < n and text[end_i] == ',':
+                    # Comma immediately after */ — strip it
+                    i = end_i + 1
+                elif end_i < n and text[end_i] == '\n':
+                    # Newline after */ — strip trailing comma only
+                    # Walk back to find the last non-whitespace character
+                    j = len(result) - 1
+                    while j >= 0 and result[j] in (' ', '\t'):
+                        j -= 1
+                    if j >= 0 and result[j] == ',':
+                        result.pop()  # pop comma only
+                    i = end_i
+                else:
+                    i = end_i
         else:
             result.append(ch)
             i += 1
@@ -200,3 +221,66 @@ def is_language_enabled(language: str, repo: str | None = None) -> bool:
     if languages is None:  # None = all enabled
         return True
     return language in languages
+
+
+# Lazy import to avoid circular dependency
+def generate_template() -> str:
+    """Return default config.jsonc content."""
+    from .parser.languages import LANGUAGE_REGISTRY
+
+    languages_list = list(LANGUAGE_REGISTRY.keys())
+    lang_str = ", ".join(f'"{lang}"' for lang in languages_list)
+
+    return f'''// jcodemunch-mcp configuration
+// Global: ~/.code-index/config.jsonc
+// Project: {{project_root}}/.jcodemunch.jsonc (optional, overrides global)
+//
+// All values below show defaults. Uncomment to override.
+// Env vars still work as fallback but are deprecated.
+{{
+  // === Indexing ===
+  "use_ai_summaries": true,
+  "max_folder_files": 2000,
+  "max_index_files": 10000,
+  "staleness_days": 7,
+  "max_results": 500,
+  "extra_ignore_patterns": [],
+  "extra_extensions": {{}},
+  "context_providers": true,
+
+  // === Meta Response Control ===
+  "meta_fields": null,
+
+  // === Languages ===
+  "languages": [{lang_str}],
+
+  // === Disabled Tools ===
+  "disabled_tools": [],
+
+  // === Descriptions ===
+  "descriptions": {{}},
+
+  // === Transport ===
+  "transport": "stdio",
+  "host": "127.0.0.1",
+  "port": 8901,
+  "rate_limit": 0,
+
+  // === Watcher ===
+  "watch": false,
+  "watch_debounce_ms": 2000,
+  "freshness_mode": "relaxed",
+  "claude_poll_interval": 5.0,
+
+  // === Logging ===
+  "log_level": "WARNING",
+  "log_file": null,
+
+  // === Privacy & Telemetry ===
+  "redact_source_root": false,
+  "stats_file_interval": 3,
+  "share_savings": true,
+  "summarizer_concurrency": 4,
+  "allow_remote_summarizer": false
+}}
+'''

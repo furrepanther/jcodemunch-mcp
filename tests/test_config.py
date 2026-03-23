@@ -1,5 +1,6 @@
 """Tests for JSONC config parsing."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -15,13 +16,19 @@ class TestJSONCParser:
         """Should strip // comments to end of line."""
         text = '{"key": "value" // this is a comment\n}'
         result = _strip_jsonc(text)
+        # Space before // is preserved; valid JSON
         assert result == '{"key": "value" \n}'
+        import json
+        json.loads(result)  # Must be valid JSON
 
     def test_strips_line_comment_no_trailing_newline(self):
         """Should strip // comment at end of file."""
         text = '{"key": "value"} // comment'
         result = _strip_jsonc(text)
+        # Space before // is preserved
         assert result == '{"key": "value"} '
+        import json
+        json.loads(result)  # Must be valid JSON
 
     def test_strips_block_comments(self):
         """Should strip /* */ block comments."""
@@ -214,3 +221,35 @@ class TestConfigGetters:
             assert is_language_enabled("python") is True
             assert is_language_enabled("javascript") is True
             assert is_language_enabled("sql") is False
+
+
+class TestTemplateGeneration:
+    """Test config template generation."""
+
+    def test_generate_template_returns_valid_jsonc(self):
+        """Should generate valid JSONC template."""
+        from src.jcodemunch_mcp.config import generate_template
+
+        template = generate_template()
+
+        # Should be parseable after stripping comments
+        from src.jcodemunch_mcp.config import _strip_jsonc
+        stripped = _strip_jsonc(template)
+        parsed = json.loads(stripped)
+
+        assert "languages" in parsed
+        assert "disabled_tools" in parsed
+        assert "meta_fields" in parsed
+
+    def test_template_languages_synced_from_registry(self):
+        """Should include all languages from LANGUAGE_REGISTRY."""
+        from src.jcodemunch_mcp.config import generate_template
+        from src.jcodemunch_mcp.parser.languages import LANGUAGE_REGISTRY
+
+        template = generate_template()
+        stripped = _strip_jsonc(template)
+        parsed = json.loads(stripped)
+
+        # All registry languages should be in template
+        for lang in LANGUAGE_REGISTRY.keys():
+            assert lang in parsed["languages"]
