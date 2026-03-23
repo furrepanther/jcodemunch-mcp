@@ -102,15 +102,15 @@ def search_text(
         if not full_path:
             continue
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-                content = f.read()
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
         except OSError:
             continue
 
         files_searched += 1
-        lines = content.split("\n")
         file_matches = []
         for line_index, line in enumerate(lines):
+            line = line.rstrip("\n")
             hit = pattern.search(line) if pattern else (query_lower in line.lower())
             if not hit:
                 continue

@@ -101,10 +101,12 @@ def _is_gitignored_fast(resolved_str: str, specs: list[tuple[str, "pathspec.Path
     """String-based gitignore check — avoids Path.relative_to() overhead.
 
     Same semantics as _is_gitignored but uses string prefix matching instead
-    of Path operations (~10x faster in the inner loop).
+    of Path operations (~10x faster in the inner loop). Uses os.path.normcase
+    for the prefix comparison so the check is case-insensitive on Windows.
     """
+    resolved_norm = os.path.normcase(resolved_str)
     for dir_prefix, spec in specs:
-        if not resolved_str.startswith(dir_prefix):
+        if not resolved_norm.startswith(os.path.normcase(dir_prefix)):
             continue
         rel = resolved_str[len(dir_prefix):].replace("\\", "/")
         if spec.match_file(rel):
@@ -176,9 +178,13 @@ def discover_local_files(
         (str(d) + os.sep, spec) for d, spec in gitignore_specs.items()
     ] if gitignore_specs else []
 
-    # Pre-compute root path strings (root is already resolved above)
+    # Pre-compute root path strings (root is already resolved above).
+    # Normalized variants use os.path.normcase for case-insensitive comparison
+    # on Windows (no-op on POSIX).
     root_str = str(root)
     root_prefix = root_str + os.sep
+    root_str_norm = os.path.normcase(root_str)
+    root_prefix_norm = os.path.normcase(root_prefix)
 
     # Merge env-var global patterns with per-call patterns, then build spec
     effective_extra = get_extra_ignore_patterns(extra_ignore_patterns)
@@ -210,16 +216,18 @@ def discover_local_files(
             logger.debug("SKIP unreadable (resolve failed): %s", file_path)
             continue
         resolved_str = str(resolved)
+        resolved_norm = os.path.normcase(resolved_str)
 
         # Path traversal check (same logic as validate_path but avoids
-        # re-resolving root on every iteration)
-        if not (resolved_str == root_str or resolved_str.startswith(root_prefix)):
+        # re-resolving root on every iteration). Uses normcase so the check
+        # is case-insensitive on Windows.
+        if not (resolved_norm == root_str_norm or resolved_norm.startswith(root_prefix_norm)):
             skip_counts["path_traversal"] += 1
             warnings.append(f"Skipped path traversal: {file_path}")
             continue
 
         # Get relative path via string slicing (avoids Path.relative_to)
-        rel_path = resolved_str[len(root_prefix):].replace("\\", "/") if resolved_str != root_str else ""
+        rel_path = resolved_str[len(root_prefix):].replace("\\", "/") if resolved_norm != root_str_norm else ""
         if not rel_path:
             continue
 

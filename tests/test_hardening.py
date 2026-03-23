@@ -1084,3 +1084,52 @@ class TestParseGithubUrlSecurity:
         from jcodemunch_mcp.tools.index_repo import parse_github_url
         with pytest.raises(ValueError):
             parse_github_url(bad_slug)
+
+
+# ---------------------------------------------------------------------------
+# T5 — Windows gitignore case-normalisation (_is_gitignored_fast)
+# ---------------------------------------------------------------------------
+
+class TestIsGitignoredfastCaseNormalization:
+    """_is_gitignored_fast must match gitignore patterns case-insensitively on Windows."""
+
+    def _make_specs(self, dir_prefix: str, patterns: list[str]):
+        """Build a gitignore_str_specs list with a single spec."""
+        import pathspec
+        spec = pathspec.PathSpec.from_lines("gitignore", patterns)
+        return [(dir_prefix, spec)]
+
+    def test_exact_match(self, tmp_path):
+        """Standard case — dir_prefix and resolved_str share the same casing."""
+        from jcodemunch_mcp.tools.index_folder import _is_gitignored_fast
+        prefix = str(tmp_path) + "\\"
+        specs = self._make_specs(prefix, ["*.pyc"])
+        assert _is_gitignored_fast(str(tmp_path / "foo.pyc"), specs) is True
+        assert _is_gitignored_fast(str(tmp_path / "foo.py"), specs) is False
+
+    @pytest.mark.skipif(
+        __import__("os").path.normcase("A") == "A",
+        reason="case normalization is only relevant on Windows",
+    )
+    def test_case_mismatch_still_matches(self, tmp_path):
+        """If the dir_prefix has different casing than the resolved path, it must still match."""
+        from jcodemunch_mcp.tools.index_folder import _is_gitignored_fast
+        # Simulate Windows path where dir_prefix was stored with different case
+        prefix_upper = str(tmp_path).upper() + "\\"
+        prefix_lower = str(tmp_path).lower() + "\\"
+        specs_upper = self._make_specs(prefix_upper, ["*.log"])
+        specs_lower = self._make_specs(prefix_lower, ["*.log"])
+
+        file_str = str(tmp_path / "app.log")
+        # Both prefix casings should match the file regardless
+        assert _is_gitignored_fast(file_str, specs_upper) is True
+        assert _is_gitignored_fast(file_str, specs_lower) is True
+
+    def test_non_child_path_not_matched(self, tmp_path):
+        """Files outside the gitignore directory must not be matched."""
+        from jcodemunch_mcp.tools.index_folder import _is_gitignored_fast
+        other = tmp_path / "other_project"
+        other.mkdir()
+        prefix = str(tmp_path / "project") + "\\"
+        specs = self._make_specs(prefix, ["*.log"])
+        assert _is_gitignored_fast(str(other / "app.log"), specs) is False
