@@ -1444,8 +1444,26 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _run_config(check: bool = False) -> None:
-    """Print the current effective configuration to stdout."""
+def _run_config(check: bool = False, init: bool = False) -> None:
+    """Print the current effective configuration to stdout, or initialize config file."""
+    # Handle --init
+    if init:
+        from . import config as _cfg
+
+        storage_path = os.environ.get("CODE_INDEX_PATH", str(Path.home() / ".code-index"))
+        config_path = Path(storage_path) / "config.jsonc"
+
+        if config_path.exists():
+            print(f"Config file already exists: {config_path}")
+            print("Refusing to overwrite. Remove it first or use --check to validate it.")
+            return
+
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        template = _cfg.generate_template()
+        config_path.write_text(template, encoding="utf-8")
+        print(f"Created config template: {config_path}")
+        print("Edit it to customize jcodemunch-mcp settings.")
+        return
     tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     enc = getattr(sys.stdout, "encoding", "ascii") or "ascii"
 
@@ -1776,6 +1794,11 @@ def main(argv: Optional[list[str]] = None):
         action="store_true",
         help="Also verify prerequisites (storage writable, AI packages installed, HTTP packages present)",
     )
+    config_parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Generate a template config.jsonc file in CODE_INDEX_PATH",
+    )
 
     # --- hook-event ---
     hook_parser = subparsers.add_parser(
@@ -1843,7 +1866,10 @@ def main(argv: Optional[list[str]] = None):
         args = parser.parse_args(raw_argv)
 
     if args.command == "config":
-        _run_config(check=getattr(args, "check", False))
+        _run_config(
+            check=getattr(args, "check", False),
+            init=getattr(args, "init", False),
+        )
         return
 
     _setup_logging(args)
