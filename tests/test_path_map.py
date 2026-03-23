@@ -176,7 +176,7 @@ def test_index_folder_reverse_remap_finds_existing_index(tmp_path, monkeypatch):
     monkeypatch.setenv("JCODEMUNCH_USE_AI_SUMMARIES", "false")
     storage = str(tmp_path / ".index")
 
-    # Index using the real path
+    # Index using the real path (simulates "original machine" build)
     result = index_folder(
         path=str(tmp_path),
         storage_path=storage,
@@ -184,16 +184,25 @@ def test_index_folder_reverse_remap_finds_existing_index(tmp_path, monkeypatch):
     )
     assert result.get("success"), result
 
-    # Pretend the folder lives at a different prefix on the current machine
-    fake_prefix = str(tmp_path.parent / "remapped_root")
-    fake_path = fake_prefix + "/" + tmp_path.name
+    # Simulate "current machine" using a different prefix
+    # Create a real directory at the fake path so the file walk succeeds
+    fake_parent = tmp_path.parent / "remapped_root"
+    fake_parent.mkdir()
+    fake_path_dir = fake_parent / tmp_path.name
+    fake_path_dir.mkdir()
+    (fake_path_dir / "hello.py").write_text("def hello(): pass\n")
 
-    # Tell path_map: fake_prefix → real parent prefix
-    monkeypatch.setenv(ENV_VAR, f"{fake_prefix}={str(tmp_path.parent)}")
+    # ENV_VAR format: orig=new (stored prefix = current machine prefix)
+    # The index was built with tmp_path.parent as the prefix ("original machine")
+    # On "current machine" the same project is at fake_parent
+    monkeypatch.setenv(ENV_VAR, f"{str(tmp_path.parent)}={str(fake_parent)}")
 
-    # Call index_folder with the fake path — should detect "no changes"
+    # Call index_folder with the "current machine" path
+    # Reverse remap: looks for new=fake_parent → replaces with orig=tmp_path.parent
+    # → hash is computed as if path were tmp_path → matches stored hash!
+    # File walk uses fake_path_dir (which exists and has same content)
     result2 = index_folder(
-        path=fake_path,
+        path=str(fake_path_dir),
         storage_path=storage,
         use_ai_summaries=False,
         incremental=True,

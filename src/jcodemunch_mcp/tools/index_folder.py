@@ -355,13 +355,6 @@ def index_folder(
     Returns:
         Dict with indexing results.
     """
-    # Reverse-remap caller-supplied path back to the stored path prefix so that
-    # the hash derived by _local_repo_name matches the index built on the original
-    # machine (or path).  The file walk uses this resolved path too — if the
-    # remapped path doesn't exist locally the existence check below will surface it.
-    _path_pairs = parse_path_map()
-    path = remap(str(Path(path).expanduser()), _path_pairs, reverse=False)
-
     # Resolve folder path
     folder_path = Path(path).expanduser().resolve()
 
@@ -451,7 +444,8 @@ def index_folder(
         # When the watcher provides the exact change set, skip full directory
         # discovery (~3s on Windows) and only process the affected files.
         if changed_paths and incremental:
-            repo_name = _local_repo_name(folder_path)
+            _pairs = parse_path_map()
+            repo_name = _local_repo_name(Path(remap(str(folder_path), _pairs, reverse=True)))
             owner = "local"
             store = IndexStore(base_path=storage_path)
 
@@ -703,7 +697,8 @@ def index_folder(
             logger.info("Active context providers: %s", names)
 
         # Create repo identifier from folder path
-        repo_name = _local_repo_name(folder_path)
+        _pairs = parse_path_map()
+        repo_name = _local_repo_name(Path(remap(str(folder_path), _pairs, reverse=True)))
         owner = "local"
         store = IndexStore(base_path=storage_path)
         existing_index = store.load_index(owner, repo_name)
