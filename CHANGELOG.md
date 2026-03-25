@@ -4,6 +4,12 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-03-25
+
+### Fixed
+- **`resolve_repo` hang on Windows** — added `stdin=subprocess.DEVNULL` to the git subprocess call in `_git_toplevel()`. Without it, the git child process inherits the MCP stdio pipe and blocks indefinitely. Same pattern fixed in v1.1.7 for `index_folder`. Closes #166.
+- **`parse_git_worktrees` hang on Windows** (watcher) — same missing `stdin=subprocess.DEVNULL` fix, preventative.
+
 ## [1.8.3] - 2026-03-18
 
 ### Added
