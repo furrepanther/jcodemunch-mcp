@@ -1045,8 +1045,17 @@ def index_folder(
         if warnings:
             result["warnings"] = warnings
 
-        if skip_counts.get("file_limit", 0) > 0:
-            result["note"] = f"Folder has many files; indexed first {max_files}"
+        files_skipped_cap = skip_counts.get("file_limit", 0)
+        if files_skipped_cap > 0:
+            files_discovered = max_files + files_skipped_cap
+            result["files_discovered"] = files_discovered
+            result["files_indexed"] = max_files
+            result["files_skipped_cap"] = files_skipped_cap
+            cap_warning = (
+                f"File cap reached: {files_discovered} files discovered, {max_files} indexed, "
+                f"{files_skipped_cap} dropped. Raise JCODEMUNCH_MAX_FOLDER_FILES or narrow the path."
+            )
+            result.setdefault("warnings", []).append(cap_warning)
 
         return result
 

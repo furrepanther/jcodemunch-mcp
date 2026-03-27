@@ -134,5 +134,6 @@ def get_symbol_source(
     if errors_out:
         return {"error": errors_out[0]["error"]}
     result = symbols_out[0]
+    meta["hint"] = "Use get_context_bundle(symbol_id) to retrieve source + imports in one call"
     result["_meta"] = meta
     return result

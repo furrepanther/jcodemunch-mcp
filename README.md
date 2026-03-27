@@ -97,6 +97,21 @@ Recent releases have also made that retrieval workflow sharper and more useful i
 
 ## Real-world results
 
+### Reproducible token efficiency benchmark
+
+Measured with `tiktoken cl100k_base` across three public repos. Workflow: `search_symbols` (top 5) + `get_symbol_source` × 3 per query. Baseline: all source files concatenated (minimum cost for an agent that reads everything). [Full methodology and harness →](benchmarks/METHODOLOGY.md)
+
+| Repository | Files | Symbols | Baseline tokens | jCodeMunch tokens | Reduction |
+|------------|------:|--------:|----------------:|------------------:|----------:|
+| expressjs/express | 34 | 117 | 73,838 | ~1,300 avg | **98.4%** |
+| fastapi/fastapi | 156 | 1,359 | 214,312 | ~15,600 avg | **92.7%** |
+| gin-gonic/gin | 40 | 805 | 84,892 | ~1,730 avg | **98.0%** |
+| **Grand total (15 task-runs)** | | | **1,865,210** | **92,515** | **95.0%** |
+
+Per-query results range from 79.7% (dense FastAPI router query) to 99.8% (sparse context-bind query on Express). The 95% figure is the aggregate. Run `python benchmarks/harness/run_benchmark.py` to reproduce.
+
+### A/B test on production codebase
+
 Independent 50-iteration A/B test on a real Vue 3 + Firebase production codebase — JCodeMunch vs native tools (Grep/Glob/Read), Claude Sonnet 4.6, fresh session per iteration:
 
 | Metric | Native | JCodeMunch |

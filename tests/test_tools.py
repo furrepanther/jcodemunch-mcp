@@ -47,7 +47,8 @@ def test_discover_source_files():
         {"path": "include/engine.hpp", "type": "blob", "size": 350},
     ]
 
-    files, _, truncated = discover_source_files(tree_entries, gitignore_content=None)
+    files, _, truncated, _total = discover_source_files(tree_entries, gitignore_content=None)
+
 
     assert "src/main.py" in files
     assert "src/utils.py" in files
@@ -64,7 +65,7 @@ def test_discover_source_files_respects_max():
         {"path": f"file{i}.py", "type": "blob", "size": 100} for i in range(1000)
     ]
 
-    files, _, truncated = discover_source_files(tree_entries, max_files=100)
+    files, _, truncated, _total = discover_source_files(tree_entries, max_files=100)
     assert len(files) == 100
     assert truncated is True
 
@@ -72,10 +73,14 @@ def test_discover_source_files_respects_max():
 def test_discover_source_files_prioritizes_src():
     """Test that src/ files are prioritized."""
     tree_entries = [
-        {"path": f"other/file{i}.py", "type": "blob", "size": 100} for i in range(300)
-    ] + [{"path": f"src/file{i}.py", "type": "blob", "size": 100} for i in range(300)]
+        {"path": f"other/file{i}.py", "type": "blob", "size": 100}
+        for i in range(300)
+    ] + [
+        {"path": f"src/file{i}.py", "type": "blob", "size": 100}
+        for i in range(300)
+    ]
 
-    files, _, truncated = discover_source_files(tree_entries, max_files=100)
+    files, _, truncated, _total = discover_source_files(tree_entries, max_files=100)
     # Most files should be from src/
     src_count = sum(1 for f in files if f.startswith("src/"))
     assert src_count > 50  # Majority should be src/
@@ -95,7 +100,7 @@ def test_discover_source_files_uses_config_override():
 
     try:
         config_module._GLOBAL_CONFIG["max_index_files"] = 7
-        files, _, truncated = discover_source_files(tree_entries)
+        files, _, truncated, _total = discover_source_files(tree_entries)
 
         assert len(files) == 7
         assert truncated is True
@@ -117,7 +122,7 @@ def test_discover_source_files_explicit_max_overrides_config():
 
     try:
         config_module._GLOBAL_CONFIG["max_index_files"] = 7
-        files, _, truncated = discover_source_files(tree_entries, max_files=5)
+        files, _, truncated, _total = discover_source_files(tree_entries, max_files=5)
 
         assert len(files) == 5
         assert truncated is True
@@ -132,7 +137,7 @@ def test_discover_source_files_exact_limit_is_not_truncated():
         {"path": f"file{i}.py", "type": "blob", "size": 100} for i in range(5)
     ]
 
-    files, _, truncated = discover_source_files(tree_entries, max_files=5)
+    files, _, truncated, _total = discover_source_files(tree_entries, max_files=5)
 
     assert len(files) == 5
     assert truncated is False

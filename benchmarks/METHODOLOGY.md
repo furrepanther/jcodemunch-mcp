@@ -115,3 +115,31 @@ Retrieval precision (96% as reported in jMunchWorkbench) is measured by:
 This evaluation is performed by jMunchWorkbench, which runs the same
 prompt in two modes (baseline vs. jcodemunch) and compares answers,
 tokens, and latency side-by-side.
+
+## Common Misreadings
+
+**"The claim is up to 99%."**
+The primary claim is **95% average** across all 15 task-runs (1,865,210 baseline tokens →
+92,515 jCodeMunch tokens). Individual queries reach 99%+ on small repos with sparse
+symbol matches (e.g., `context bind` on expressjs/express: 99.8%). The 95% aggregate
+is the honest headline; 99% is a per-query ceiling, not a typical result.
+
+**"I tested a different repo and got 80%."**
+Results vary by repo structure. Flat script collections (e.g., a repository of hundreds
+of unrelated standalone scripts) produce lower savings because the symbol index cannot
+distinguish which script is relevant — the agent still has to scan broadly. The benchmark
+repos (express, fastapi, gin) are structured application codebases where symbol-based
+navigation is most effective. Testing a flat script collection and comparing to our
+benchmark is an apples-to-oranges comparison.
+
+**"The benchmark is cherry-picked."**
+The three repos were chosen to represent common backend frameworks across different
+languages (JavaScript, Python, Go). No file filtering beyond standard skip patterns
+was applied. The harness (`benchmarks/harness/run_benchmark.py`) and query corpus
+(`benchmarks/tasks.json`) are open source — run them yourself and publish the results.
+
+**"The baseline is unrealistic."**
+The baseline intentionally represents the *minimum* cost for a "read everything"
+agent — one pass through all files, counted once. Real agents re-read files, branch
+across sessions, and load documentation. Actual production baseline costs are higher,
+making our reported savings a conservative lower bound.

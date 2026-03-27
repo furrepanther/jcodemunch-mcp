@@ -217,7 +217,8 @@ def discover_source_files(
         files.append(path)
         blob_shas[path] = entry.get("sha", "")
 
-    truncated = len(files) > max_files
+    files_total = len(files)
+    truncated = files_total > max_files
 
     # File count limit with prioritization
     if truncated:
@@ -236,7 +237,7 @@ def discover_source_files(
         files = files[:max_files]
         blob_shas = {p: blob_shas[p] for p in files}
 
-    return files, blob_shas, truncated
+    return files, blob_shas, truncated, files_total
 
 
 async def fetch_file_content(
@@ -342,7 +343,7 @@ async def index_repo(
         gitignore_content = await fetch_gitignore(owner, repo, github_token)
 
         # Discover source files (also collects blob SHAs for incremental diff)
-        source_files, blob_shas, truncated = discover_source_files(
+        source_files, blob_shas, truncated, files_discovered = discover_source_files(
             tree_entries,
             gitignore_content,
             max_files=max_files,
@@ -541,7 +542,14 @@ async def index_repo(
             result["warnings"] = warnings
 
         if truncated:
-            result["warnings"] = warnings + [f"Repository has many files; indexed first {max_files}"]
+            files_skipped_cap = files_discovered - max_files
+            result["files_discovered"] = files_discovered
+            result["files_indexed"] = max_files
+            result["files_skipped_cap"] = files_skipped_cap
+            result["warnings"] = warnings + [
+                f"File cap reached: {files_discovered} files discovered, {max_files} indexed, "
+                f"{files_skipped_cap} dropped. Raise JCODEMUNCH_MAX_INDEX_FILES or narrow the path."
+            ]
 
         return result
 

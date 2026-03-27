@@ -741,6 +741,26 @@ async def list_tools() -> list[Tool]:
                 "required": ["repo"]
             }
         ),
+        Tool(
+            name="check_freshness",
+            description=(
+                "Check whether a locally indexed repo is still fresh by comparing the "
+                "git HEAD SHA at index time to the current HEAD. Returns fresh (bool), "
+                "indexed_sha, current_sha, and commits_behind. Works only for repos "
+                "indexed with index_folder; for GitHub repos use index_repo (which "
+                "compares tree SHAs automatically)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repo identifier — owner/repo, display name, or local path",
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
     ]
     # Filter out disabled tools
     disabled = config_module.get("disabled_tools", [])
@@ -1108,6 +1128,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 wait_for_fresh_result,
                 repo=arguments["repo"],
                 timeout_ms=arguments.get("timeout_ms", 500),
+            )
+        elif name == "check_freshness":
+            from .tools.check_freshness import check_freshness
+            result = await asyncio.to_thread(
+                functools.partial(
+                    check_freshness,
+                    repo=arguments["repo"],
+                    storage_path=storage_path,
+                )
             )
         else:
             result = {"error": f"Unknown tool: {name}"}

@@ -1,7 +1,7 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.11.5 (published to PyPI)
+- **Version:** 1.11.8 (published to PyPI)
 - **INDEX_VERSION:** 6
 - **Tests:** 1119 passed, 7 skipped
 - **Python:** >=3.10
@@ -218,6 +218,9 @@ Custom parsers (tree-sitter grammar lacks clean named fields):
 | 1.11.3 | Fix: debug logging for all three silent skip paths (skip_dir, skip_file, secret) + skip_dir/skip_file counters in discovery summary; add exclude_secret_patterns config option to suppress specific SECRET_PATTERNS entries (workaround for *secret* glob false-positives on full relative paths in Go monorepos); 6 new tests — contributed by DrHayt (PR #168) |
 | 1.11.4 | Fix: import-graph tools (find_importers, get_blast_radius, get_dependency_graph, and 5 others) now resolve TypeScript/SvelteKit path aliases (@/*, $lib/*) by reading compilerOptions.paths from tsconfig.json/jsconfig.json at the project root; also resolves TypeScript ESM .js→.ts extension convention; alias_map auto-loaded from source_root and module-level cached; 10 new tests — closes #169 |
 | 1.11.5 | Fix: tsconfig.json/jsconfig.json are now parsed as JSONC (strips // and /* */ comments and trailing commas) — previously json.loads() silently failed on commented tsconfigs, leaving alias_map empty and causing find_importers/get_blast_radius to return 0 alias-based results; also adds test for nested layout with specific @/lib/* overrides; 5 new tests — closes #170 |
+| 1.11.6 | UX: structured file-cap warnings — index_folder and index_repo now surface files_discovered, files_indexed, and files_skipped_cap fields plus a human-readable warning when the file cap is hit (previously a silent "note"); search_symbols and get_symbol_source single-symbol responses now include a _meta hint pointing to get_context_bundle; benchmark docs expanded with "Common Misreadings" section in METHODOLOGY.md and reproducible results table added to README |
+| 1.11.7 | Feat: check_freshness tool — compares git HEAD SHA at index time to current HEAD for locally indexed repos; returns fresh (bool), indexed_sha, current_sha, commits_behind; GitHub repos return is_local=False with clear message. get_repo_outline staleness check upgraded to SHA-based (accurate) with time-based fallback for GitHub/no-git repos; is_stale added to _meta; 8 new tests |
+| 1.11.8 | Feat: trusted_folders allowlist for index_folder() — new config key `trusted_folders` (+ `trusted_folders_whitelist_mode`) with env var fallbacks; whitelist mode (default) restricts indexing to named roots; blacklist mode blocks specific paths while trusting all others; path-aware matching (not string-prefix); project config supports `.`, `./subdir`, and bare relative paths; escape-attempt rejection; backward compatible (empty list = unchanged behavior) — contributed by tmeckel (PR #175) |
 
 ## Maintenance Practices
 

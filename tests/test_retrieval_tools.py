@@ -3,6 +3,7 @@
 import json
 import pytest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from jcodemunch_mcp.parser import Symbol
 from jcodemunch_mcp.storage import IndexStore
@@ -104,6 +105,43 @@ def test_get_repo_outline_no_staleness_warning_when_fresh(tmp_path):
     result = get_repo_outline("retrieval/demo", storage_path=str(tmp_path))
 
     assert "staleness_warning" not in result
+
+
+def test_sha_staleness_in_meta(tmp_path):
+    """get_repo_outline _meta should include is_stale=True when SHA differs."""
+    store = IndexStore(base_path=str(tmp_path))
+    from jcodemunch_mcp.parser import Symbol
+    symbol = Symbol(
+        id="src-main-py::run#function",
+        file="src/main.py",
+        name="run",
+        qualified_name="run",
+        kind="function",
+        language="python",
+        signature="def run():",
+        byte_offset=0,
+        byte_length=45,
+    )
+    store.save_index(
+        owner="retrieval",
+        name="demo_sha",
+        source_files=["src/main.py"],
+        symbols=[symbol],
+        raw_files={"src/main.py": "def run(): pass\n"},
+        languages={"python": 1},
+        file_languages={"src/main.py": "python"},
+        file_summaries={"src/main.py": "Entry point."},
+        git_head="aaa000bbb111ccc222ddd333eee444fff555aaa0",
+        source_root=str(tmp_path / "myrepo"),
+    )
+    stale_sha = "999999888888777777666666555555444444333a"
+    with patch(
+        "jcodemunch_mcp.tools.get_repo_outline._get_git_head",
+        return_value=stale_sha,
+    ):
+        result = get_repo_outline("retrieval/demo_sha", storage_path=str(tmp_path))
+    assert result["_meta"]["is_stale"] is True
+    assert "staleness_warning" in result
 
 
 def test_search_text_groups_matches_and_includes_context(tmp_path):

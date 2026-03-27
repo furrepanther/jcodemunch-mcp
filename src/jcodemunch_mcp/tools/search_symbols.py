@@ -364,6 +364,8 @@ def search_symbols(
         meta["tokens_remaining"] = max(0, token_budget - used // BYTES_PER_TOKEN)
     if debug:
         meta["candidates_scored"] = candidates_scored
+    if scored_results:
+        meta["hint"] = "Use get_context_bundle(symbol_id) to retrieve source + imports in one call"
 
     return {
         "result_count": len(scored_results),

@@ -9,6 +9,7 @@ from typing import Optional
 
 from .. import config as _config
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
+from ..storage.index_store import _get_git_head
 from ..parser.imports import resolve_specifier
 from ._utils import resolve_repo
 
@@ -97,18 +98,34 @@ def get_repo_outline(
 
     elapsed = (time.perf_counter() - start) * 1000
 
-    # Staleness warning
+    # Staleness check — SHA-based (accurate) with time-based fallback
     staleness_warning = None
+    is_stale = None
     try:
-        staleness_days = _config.get("staleness_days", 7)
-        indexed_dt = datetime.fromisoformat(index.indexed_at)
-        if indexed_dt.tzinfo is None:
-            indexed_dt = indexed_dt.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - indexed_dt).days
-        if age_days >= staleness_days:
-            staleness_warning = (
-                f"Index is {age_days} days old. Run index_folder or index_repo to refresh."
-            )
+        from pathlib import Path
+
+        if index.source_root and index.git_head:
+            # Local repo: compare SHAs
+            current_sha = _get_git_head(Path(index.source_root))
+            if current_sha is not None:
+                is_stale = current_sha != index.git_head
+                if is_stale:
+                    staleness_warning = (
+                        f"Index SHA ({index.git_head[:12]}) does not match current HEAD "
+                        f"({current_sha[:12]}). Run index_folder to refresh."
+                    )
+        else:
+            # GitHub repo or no git: fall back to time-based check
+            staleness_days = _config.get("staleness_days", 7)
+            indexed_dt = datetime.fromisoformat(index.indexed_at)
+            if indexed_dt.tzinfo is None:
+                indexed_dt = indexed_dt.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - indexed_dt).days
+            if age_days >= staleness_days:
+                is_stale = True
+                staleness_warning = (
+                    f"Index is {age_days} days old. Run index_repo to refresh."
+                )
     except Exception:
         pass
 
@@ -118,6 +135,7 @@ def get_repo_outline(
             "timing_ms": round(elapsed, 1),
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
+            "is_stale": is_stale,
             **cost_avoided(tokens_saved, total_saved),
         },
     }
