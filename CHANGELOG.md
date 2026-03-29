@@ -4,6 +4,11 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-03-29
+
+### Added
+- **YAML and Ansible parser support** (PR #183 — contributed by SkaldeStefan) — `.yaml` and `.yml` files are now indexed as first-class symbols. A path-heuristic layer (`_looks_like_ansible_path`) automatically promotes Ansible-structured files (playbooks, roles, group_vars, host_vars, tasks, handlers, defaults) to the `ansible` language so they receive Ansible-aware symbol extraction: plays as `class`, tasks as `function`, roles and handlers as `type`, and variables as `constant`. Generic YAML falls back to a structural walker that emits container keys as `type` and scalar keys as `constant`. Multi-document YAML (multiple `---` sections) is handled correctly. pyyaml is already a base dependency — no extra install step. 8 new tests (1317 total).
+
 ## [1.12.4] - 2026-03-29
 
 ### Added
