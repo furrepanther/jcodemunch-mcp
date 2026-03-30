@@ -4,6 +4,13 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.12.9] — docs patch 2026-03-30
+
+### Changed
+- **QUICKSTART.md Step 3** — upgraded AGENT_HOOKS.md footnote to an `[!IMPORTANT]` callout naming the "pressure bypass" failure mode (agent sees CLAUDE.md rule, ignores it under load) and explaining why hooks are needed for hard enforcement.
+- **QUICKSTART.md Troubleshooting** — added entry for "Claude uses jCodeMunch in simple tasks but falls back to Read/Grep in complex ones" pointing to AGENT_HOOKS.md.
+- **AGENT_HOOKS.md intro** — sharpened to explicitly name the failure mode: the agent sees the rule and skips it anyway because native tools feel faster under pressure or in long sessions.
+
 ## [1.12.9] - 2026-03-29
 
 ### Added
