@@ -9,7 +9,7 @@ from typing import Optional
 
 from ..storage import IndexStore, CodeIndex, record_savings, estimate_savings, cost_avoided
 from ..parser.imports import resolve_specifier
-from ._utils import resolve_repo
+from ._utils import resolve_repo, resolve_fqn
 
 BYTES_PER_TOKEN = 4
 
@@ -235,7 +235,8 @@ def search_symbols(
     semantic: bool = False,
     semantic_weight: float = 0.5,
     semantic_only: bool = False,
-    storage_path: Optional[str] = None
+    storage_path: Optional[str] = None,
+    fqn: Optional[str] = None,
 ) -> dict:
     """Search for symbols matching a query.
 
@@ -281,6 +282,12 @@ def search_symbols(
 
     if sort_by not in ("relevance", "centrality", "combined"):
         return {"error": f"Invalid sort_by '{sort_by}'. Must be 'relevance', 'centrality', or 'combined'."}
+
+    # FQN shortcut: resolve PHP FQN and use class name as query
+    if fqn:
+        _resolved, _ = resolve_fqn(repo, fqn, storage_path)
+        if _resolved:
+            query = fqn.rsplit("\\", 1)[-1].split("::")[0]
 
     _MAX_QUERY_LEN = 500
     if len(query) > _MAX_QUERY_LEN:

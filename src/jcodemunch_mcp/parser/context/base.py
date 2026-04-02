@@ -123,6 +123,20 @@ class ContextProvider(ABC):
         """
         return {}
 
+    def get_extra_imports(self) -> dict[str, list[dict]]:
+        """Return additional import edges discovered by this provider.
+
+        Override in subclasses to inject framework-specific import edges
+        into the dependency graph (e.g., Blade template references,
+        route-to-controller mappings).
+
+        Returns:
+            Dict mapping relative file paths to lists of import dicts::
+
+                {"routes/web.php": [{"specifier": "App\\\\Http\\\\Controllers\\\\UserController", "names": ["UserController"]}]}
+        """
+        return {}
+
 
 # -- Registry of known providers --
 
@@ -195,3 +209,32 @@ def enrich_symbols(symbols: list, providers: list[ContextProvider]) -> None:
 
         if context_parts:
             sym.ecosystem_context = "; ".join(context_parts)
+
+
+def collect_extra_imports(
+    providers: list[ContextProvider],
+    file_imports: dict[str, list[dict]],
+) -> None:
+    """Merge extra import edges from context providers into file_imports in-place.
+
+    Providers can inject framework-specific import edges (e.g., Blade template
+    references, route→controller mappings) that the standard language-level
+    import extractor cannot detect.
+    """
+    for provider in providers:
+        try:
+            extras = provider.get_extra_imports()
+            for file_path, imports in extras.items():
+                if file_path in file_imports:
+                    # Deduplicate: only add specifiers not already present
+                    existing = {imp["specifier"] for imp in file_imports[file_path]}
+                    for imp in imports:
+                        if imp["specifier"] not in existing:
+                            file_imports[file_path].append(imp)
+                            existing.add(imp["specifier"])
+                else:
+                    file_imports[file_path] = list(imports)
+        except Exception as e:
+            logger.warning(
+                "Extra imports from '%s' failed: %s", provider.name, e
+            )

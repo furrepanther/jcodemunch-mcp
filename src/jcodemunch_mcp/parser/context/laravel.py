@@ -83,7 +83,81 @@ _BLADE_X_COMPONENT = re.compile(r"""<x-(?P<name>[\w\-.]+)""", re.MULTILINE)
 
 # Blade dot-notation: @extends('layouts.app'), @include('partials.header'), view('users.index')
 _BLADE_DOTREF = re.compile(
-    r"""(?:@extends|@include(?:When|First)?|@component|view)\s*\(\s*['"](?P<ref>[^'"]+)['"]""",
+    r"""(?:@extends|@include|@component|view)\s*\(\s*['"](?P<ref>[^'"]+)['"]""",
+    re.MULTILINE,
+)
+
+# @includeWhen($cond, 'view'), @includeUnless($cond, 'view'), @includeFirst(['a', 'b'])
+_BLADE_INCLUDE_CONDITIONAL = re.compile(
+    r"""@include(?:When|Unless)\s*\([^,]+,\s*['"](?P<ref>[^'"]+)['"]""",
+    re.MULTILINE,
+)
+
+# Inertia.js render calls: Inertia::render('Users/Index'), inertia('Dashboard')
+_INERTIA_RENDER = re.compile(
+    r"""(?:Inertia\s*::\s*render|inertia)\s*\(\s*['"](?P<page>[^'"]+)['"]""",
+    re.MULTILINE,
+)
+
+# Frontend API calls: fetch('/api/...'), axios.get('/api/...'), useFetch('/api/...'), $fetch('/api/...')
+_API_CALL = re.compile(
+    r"""(?:fetch|axios\s*\.\s*\w+|\$fetch|useFetch|useAsyncData)\s*\(\s*"""
+    r"""['"`](?P<url>/api/[^'"`$]+)['"`]""",
+    re.MULTILINE,
+)
+
+# Static facade calls: Cache::get(), DB::table(), etc.
+# Built dynamically after _LARAVEL_FACADES is defined (see below).
+
+# Laravel built-in facade → underlying service class mapping
+_LARAVEL_FACADES: dict[str, str] = {
+    "App": "Illuminate\\Foundation\\Application",
+    "Artisan": "Illuminate\\Contracts\\Console\\Kernel",
+    "Auth": "Illuminate\\Auth\\AuthManager",
+    "Blade": "Illuminate\\View\\Compilers\\BladeCompiler",
+    "Broadcast": "Illuminate\\Contracts\\Broadcasting\\Factory",
+    "Bus": "Illuminate\\Contracts\\Bus\\Dispatcher",
+    "Cache": "Illuminate\\Cache\\CacheManager",
+    "Config": "Illuminate\\Config\\Repository",
+    "Context": "Illuminate\\Log\\Context\\Repository",
+    "Cookie": "Illuminate\\Cookie\\CookieJar",
+    "Crypt": "Illuminate\\Encryption\\Encrypter",
+    "Date": "Illuminate\\Support\\DateFactory",
+    "DB": "Illuminate\\Database\\DatabaseManager",
+    "Event": "Illuminate\\Events\\Dispatcher",
+    "File": "Illuminate\\Filesystem\\Filesystem",
+    "Gate": "Illuminate\\Contracts\\Auth\\Access\\Gate",
+    "Hash": "Illuminate\\Hashing\\HashManager",
+    "Http": "Illuminate\\Http\\Client\\Factory",
+    "Lang": "Illuminate\\Translation\\Translator",
+    "Log": "Illuminate\\Log\\LogManager",
+    "Mail": "Illuminate\\Mail\\Mailer",
+    "Notification": "Illuminate\\Notifications\\ChannelManager",
+    "Password": "Illuminate\\Auth\\Passwords\\PasswordBrokerManager",
+    "Pipeline": "Illuminate\\Pipeline\\Pipeline",
+    "Process": "Illuminate\\Process\\Factory",
+    "Queue": "Illuminate\\Queue\\QueueManager",
+    "RateLimiter": "Illuminate\\Cache\\RateLimiter",
+    "Redirect": "Illuminate\\Routing\\Redirector",
+    "Redis": "Illuminate\\Redis\\RedisManager",
+    "Request": "Illuminate\\Http\\Request",
+    "Response": "Illuminate\\Routing\\ResponseFactory",
+    "Route": "Illuminate\\Routing\\Router",
+    "Schedule": "Illuminate\\Console\\Scheduling\\Schedule",
+    "Schema": "Illuminate\\Database\\Schema\\Builder",
+    "Session": "Illuminate\\Session\\SessionManager",
+    "Storage": "Illuminate\\Filesystem\\FilesystemManager",
+    "URL": "Illuminate\\Routing\\UrlGenerator",
+    "Validator": "Illuminate\\Validation\\Factory",
+    "View": "Illuminate\\View\\Factory",
+    "Vite": "Illuminate\\Foundation\\Vite",
+}
+
+# Build regex from known facade names: matches Cache::get(), DB::table(), etc.
+# Excludes Foo::class references (class constant, not a call).
+_FACADE_NAMES_PATTERN = "|".join(re.escape(f) for f in sorted(_LARAVEL_FACADES, key=len, reverse=True))
+_FACADE_STATIC_CALL = re.compile(
+    rf"""(?<![>\w\\])(?P<facade>{_FACADE_NAMES_PATTERN})\s*::\s*(?!class\b)\w+\s*\(""",
     re.MULTILINE,
 )
 
@@ -165,9 +239,12 @@ def _parse_routes(routes_dir: Path) -> list[dict]:
 def _parse_model(content: str) -> dict:
     """Extract Eloquent model metadata from PHP source."""
     relationships: list[str] = []
+    related_models: list[str] = []
     for m in _ELOQUENT_RELATION.finditer(content):
-        model_name = m.group("model").rsplit("\\", 1)[-1]
+        raw_model = m.group("model")
+        model_name = raw_model.rsplit("\\", 1)[-1]
         relationships.append(f"{m.group('type')}({model_name})")
+        related_models.append(raw_model)
 
     scopes: list[str] = [m.group("name") for m in _SCOPE_METHOD.finditer(content)]
 
@@ -184,6 +261,7 @@ def _parse_model(content: str) -> dict:
 
     return {
         "relationships": relationships,
+        "related_models": related_models,
         "scopes": scopes,
         "fillable": props.get("fillable", ""),
         "table": props.get("table", ""),
@@ -262,6 +340,10 @@ class LaravelContextProvider(ContextProvider):
         self._table_columns: dict[str, dict[str, str]] = {}
         # blade view resolution: relative folder path
         self._views_path: Optional[Path] = None
+        # Extra import edges injected into the dependency graph
+        self._extra_imports: dict[str, list[dict]] = {}
+        # API route map: normalized URI → controller file (for fetch/axios matching)
+        self._api_route_map: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -291,6 +373,9 @@ class LaravelContextProvider(ContextProvider):
                 if route["name"]:
                     summary += f" ({route['name']})"
                 self._controller_routes.setdefault(ctrl, []).append(summary)
+
+        # Build API route map: URI → controller file path (for fetch/axios matching)
+        self._build_api_route_map(routes, folder_path)
 
         # Parse Eloquent models
         models_dir = folder_path / "app" / "Models"
@@ -322,6 +407,19 @@ class LaravelContextProvider(ContextProvider):
                     properties=props,
                 )
                 model_count += 1
+
+                # Eloquent relationship → import edges
+                if meta["related_models"]:
+                    rel_path = str(php_file.relative_to(folder_path)).replace("\\", "/")
+                    rel_imports: list[dict] = []
+                    seen_models: set[str] = set()
+                    for raw_model in meta["related_models"]:
+                        if raw_model not in seen_models:
+                            short = raw_model.rsplit("\\", 1)[-1]
+                            rel_imports.append({"specifier": raw_model, "names": [short]})
+                            seen_models.add(raw_model)
+                    if rel_imports:
+                        self._extra_imports.setdefault(rel_path, []).extend(rel_imports)
 
         logger.info("Laravel: parsed %d models", model_count)
 
@@ -369,6 +467,248 @@ class LaravelContextProvider(ContextProvider):
         # Store views path for Blade resolution
         self._views_path = folder_path / "resources" / "views"
 
+        # --- Extra imports: Route files → Controllers ---
+        self._build_route_imports(routes, folder_path)
+
+        # --- Extra imports: Blade templates → referenced views ---
+        self._build_blade_imports(folder_path)
+
+        # --- Extra imports: Facade static calls → underlying classes ---
+        self._build_facade_imports(folder_path)
+
+        # --- Extra imports: Inertia.js renders → Vue/React page components ---
+        self._build_inertia_imports(folder_path)
+
+        # --- Extra imports: fetch/axios API calls → controller files ---
+        self._build_api_call_imports(folder_path)
+
+    def _build_api_route_map(self, routes: list[dict], folder_path: Path) -> None:
+        """Build a URI → controller file path mapping for API call matching."""
+        controllers_dir = folder_path / "app" / "Http" / "Controllers"
+        for route in routes:
+            uri = route.get("uri", "")
+            ctrl = route.get("controller", "")
+            if not uri or not ctrl:
+                continue
+            # Normalize: strip leading slash, replace {param} with *
+            normalized = "/" + uri.lstrip("/")
+            normalized = re.sub(r"\{[^}]+\}", "*", normalized)
+            # Try to find the controller file
+            ctrl_file = _find_controller_file(ctrl, controllers_dir, folder_path)
+            if ctrl_file:
+                self._api_route_map[normalized] = ctrl_file
+
+    def _build_route_imports(self, routes: list[dict], folder_path: Path) -> None:
+        """Create import edges from route files to their controller files."""
+        for route in routes:
+            fqn = route.get("controller_fqn", "")
+            route_file = route.get("file", "")
+            if not fqn or not route_file:
+                continue
+
+            route_rel = f"routes/{route_file}"
+            imp = {"specifier": fqn, "names": [route["controller"]]}
+
+            if route_rel in self._extra_imports:
+                # Avoid duplicate specifiers
+                existing = {i["specifier"] for i in self._extra_imports[route_rel]}
+                if fqn not in existing:
+                    self._extra_imports[route_rel].append(imp)
+            else:
+                self._extra_imports[route_rel] = [imp]
+
+    def _build_blade_imports(self, folder_path: Path) -> None:
+        """Parse Blade templates for @extends, @include, @component, <x-*> references."""
+        views_dir = folder_path / "resources" / "views"
+        if not views_dir.is_dir():
+            return
+
+        blade_count = 0
+        for blade_file in sorted(views_dir.rglob("*.blade.php")):
+            content = _read_php(blade_file)
+            if not content:
+                continue
+
+            rel_path = str(blade_file.relative_to(folder_path)).replace("\\", "/")
+            imports: list[dict] = []
+            seen: set[str] = set()
+
+            # @extends, @include, @component, view()
+            for m in _BLADE_DOTREF.finditer(content):
+                ref = m.group("ref")
+                resolved = _blade_dot_to_path(ref)
+                if resolved and resolved not in seen:
+                    imports.append({"specifier": resolved, "names": []})
+                    seen.add(resolved)
+
+            # @includeWhen($cond, 'view'), @includeUnless($cond, 'view')
+            for m in _BLADE_INCLUDE_CONDITIONAL.finditer(content):
+                ref = m.group("ref")
+                resolved = _blade_dot_to_path(ref)
+                if resolved and resolved not in seen:
+                    imports.append({"specifier": resolved, "names": []})
+                    seen.add(resolved)
+
+            # <x-component> → resources/views/components/component.blade.php
+            for m in _BLADE_X_COMPONENT.finditer(content):
+                name = m.group("name")
+                resolved = _blade_component_to_path(name)
+                if resolved and resolved not in seen:
+                    imports.append({"specifier": resolved, "names": []})
+                    seen.add(resolved)
+
+            if imports:
+                self._extra_imports[rel_path] = imports
+                blade_count += 1
+
+        if blade_count:
+            logger.info("Laravel: extracted Blade imports from %d templates", blade_count)
+
+    def _build_facade_imports(self, folder_path: Path) -> None:
+        """Scan PHP files for facade static calls and create import edges to underlying classes."""
+        facade_count = 0
+        app_dir = folder_path / "app"
+        if not app_dir.is_dir():
+            return
+
+        for php_file in sorted(app_dir.rglob("*.php")):
+            content = _read_php(php_file)
+            if not content:
+                continue
+
+            facades_used: dict[str, str] = {}
+            for m in _FACADE_STATIC_CALL.finditer(content):
+                facade_name = m.group("facade")
+                if facade_name in _LARAVEL_FACADES and facade_name not in facades_used:
+                    facades_used[facade_name] = _LARAVEL_FACADES[facade_name]
+
+            if facades_used:
+                rel_path = str(php_file.relative_to(folder_path)).replace("\\", "/")
+                imports = [
+                    {"specifier": fqn, "names": [name]}
+                    for name, fqn in facades_used.items()
+                ]
+                self._extra_imports.setdefault(rel_path, []).extend(imports)
+                facade_count += 1
+
+        if facade_count:
+            logger.info("Laravel: extracted facade imports from %d files", facade_count)
+
+    def _build_inertia_imports(self, folder_path: Path) -> None:
+        """Create import edges from PHP controllers to Inertia.js Vue/React page components."""
+        # Detect Inertia: composer require OR middleware file
+        requires = _read_composer_require(folder_path)
+        has_middleware = (folder_path / "app" / "Http" / "Middleware" / "HandleInertiaRequests.php").exists()
+        if "inertiajs/inertia-laravel" not in requires and not has_middleware:
+            return
+
+        # Find pages directory
+        pages_dir: Optional[str] = None
+        for candidate in ("resources/js/Pages", "resources/js/pages", "resources/ts/Pages"):
+            if (folder_path / candidate).is_dir():
+                pages_dir = candidate
+                break
+        if pages_dir is None:
+            return
+
+        # Scan PHP files for Inertia::render / inertia() calls
+        app_dir = folder_path / "app"
+        if not app_dir.is_dir():
+            return
+
+        inertia_count = 0
+        for php_file in sorted(app_dir.rglob("*.php")):
+            content = _read_php(php_file)
+            if not content:
+                continue
+
+            pages_found: dict[str, str] = {}
+            for m in _INERTIA_RENDER.finditer(content):
+                page = m.group("page")
+                if page in pages_found:
+                    continue
+                # Strip extension if already present (e.g. 'Users/Index.vue')
+                page_clean = re.sub(r"\.(vue|tsx|jsx)$", "", page)
+                # Resolve page path: try .vue, .tsx, .jsx
+                resolved = None
+                for ext in (".vue", ".tsx", ".jsx"):
+                    candidate_path = f"{pages_dir}/{page_clean}{ext}"
+                    if (folder_path / candidate_path).exists():
+                        resolved = candidate_path
+                        break
+                if resolved is None:
+                    # Default to .vue even if file doesn't exist yet
+                    resolved = f"{pages_dir}/{page_clean}.vue"
+                pages_found[page] = resolved
+
+            if pages_found:
+                rel_path = str(php_file.relative_to(folder_path)).replace("\\", "/")
+                imports = [
+                    {"specifier": target, "names": []}
+                    for target in pages_found.values()
+                ]
+                self._extra_imports.setdefault(rel_path, []).extend(imports)
+                inertia_count += 1
+
+        if inertia_count:
+            logger.info("Laravel: extracted Inertia imports from %d files", inertia_count)
+
+    def _build_api_call_imports(self, folder_path: Path) -> None:
+        """Scan JS/TS/Vue files for fetch/axios API calls and match to Laravel routes."""
+        if not self._api_route_map:
+            return
+
+        api_count = 0
+        for ext_pattern in ("**/*.js", "**/*.ts", "**/*.vue", "**/*.tsx", "**/*.jsx"):
+            for js_file in sorted(folder_path.glob(ext_pattern)):
+                # Skip vendor/node_modules
+                rel = str(js_file.relative_to(folder_path))
+                if "node_modules" in rel or "vendor" in rel:
+                    continue
+
+                try:
+                    content = js_file.read_text("utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                matched_controllers: dict[str, str] = {}
+                for m in _API_CALL.finditer(content):
+                    url = m.group("url")
+                    ctrl_file = self._match_api_url(url)
+                    if ctrl_file and ctrl_file not in matched_controllers:
+                        matched_controllers[ctrl_file] = url
+
+                if matched_controllers:
+                    rel_path = str(js_file.relative_to(folder_path)).replace("\\", "/")
+                    imports = [
+                        {"specifier": ctrl, "names": []}
+                        for ctrl in matched_controllers
+                    ]
+                    self._extra_imports.setdefault(rel_path, []).extend(imports)
+                    api_count += 1
+
+        if api_count:
+            logger.info("Laravel: matched API calls to routes in %d files", api_count)
+
+    def _match_api_url(self, url: str) -> Optional[str]:
+        """Match a frontend API URL to a Laravel route's controller file."""
+        normalized = "/" + url.lstrip("/")
+        # Exact match first
+        if normalized in self._api_route_map:
+            return self._api_route_map[normalized]
+        # Try matching with wildcard routes (replace path segments with *)
+        segments = normalized.rstrip("/").split("/")
+        for route_uri, ctrl_file in self._api_route_map.items():
+            route_segments = route_uri.rstrip("/").split("/")
+            if len(segments) != len(route_segments):
+                continue
+            if all(
+                rs == "*" or rs == seg
+                for rs, seg in zip(route_segments, segments)
+            ):
+                return ctrl_file
+        return None
+
     def get_file_context(self, file_path: str) -> Optional[FileContext]:
         stem = Path(file_path).stem
         ctx = self._file_contexts.get(stem)
@@ -395,13 +735,71 @@ class LaravelContextProvider(ContextProvider):
             return {}
         return {"laravel_columns": self._table_columns}
 
+    def get_extra_imports(self) -> dict[str, list[dict]]:
+        """Return Blade and route import edges for the dependency graph."""
+        return self._extra_imports
+
     def stats(self) -> dict:
         return {
             "models": sum(1 for ctx in self._file_contexts.values()
                          if "eloquent-model" in ctx.tags),
             "controllers_with_routes": len(self._controller_routes),
             "migration_tables": len(self._table_columns),
+            "blade_files_with_imports": sum(
+                1 for k in self._extra_imports
+                if k.startswith("resources/views/")
+            ),
+            "route_files_with_imports": sum(
+                1 for k in self._extra_imports
+                if k.startswith("routes/")
+            ),
+            "files_with_facade_imports": sum(
+                1 for k, v in self._extra_imports.items()
+                if any(imp["specifier"].startswith("Illuminate\\") for imp in v)
+            ),
+            "files_with_inertia_imports": sum(
+                1 for k, v in self._extra_imports.items()
+                if any("Pages/" in imp["specifier"] or "pages/" in imp["specifier"] for imp in v)
+            ),
+            "api_routes_mapped": len(self._api_route_map),
         }
+
+
+def _find_controller_file(
+    controller_name: str, controllers_dir: Path, folder_path: Path
+) -> Optional[str]:
+    """Find a controller's repo-relative file path by class name."""
+    if not controllers_dir.is_dir():
+        return None
+    for php_file in controllers_dir.rglob("*.php"):
+        if php_file.stem == controller_name:
+            return str(php_file.relative_to(folder_path)).replace("\\", "/")
+    return None
+
+
+def _blade_dot_to_path(dot_ref: str) -> Optional[str]:
+    """Convert Blade dot-notation to a relative file path.
+
+    Example: 'layouts.app' → 'resources/views/layouts/app.blade.php'
+    Returns None for empty or invalid references.
+    """
+    if not dot_ref or dot_ref == ".":
+        return None
+    parts = dot_ref.replace(".", "/")
+    return f"resources/views/{parts}.blade.php"
+
+
+def _blade_component_to_path(component_name: str) -> Optional[str]:
+    """Convert <x-component> name to a relative file path.
+
+    Example: 'alert' → 'resources/views/components/alert.blade.php'
+             'forms.input' → 'resources/views/components/forms/input.blade.php'
+    Returns None for empty names.
+    """
+    if not component_name:
+        return None
+    parts = component_name.replace(".", "/")
+    return f"resources/views/components/{parts}.blade.php"
 
 
 def _guess_table(model_stem: str) -> str:

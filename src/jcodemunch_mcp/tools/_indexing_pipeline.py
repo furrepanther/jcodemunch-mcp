@@ -5,7 +5,7 @@ from collections import defaultdict
 from typing import Optional
 
 from ..parser import parse_file, get_language_for_path
-from ..parser.context import ContextProvider, enrich_symbols
+from ..parser.context import ContextProvider, enrich_symbols, collect_extra_imports
 from ..parser.imports import extract_imports
 from ..parser.symbols import Symbol
 from ..summarizer import summarize_symbols, generate_file_summaries
@@ -143,6 +143,10 @@ def parse_immediate(
         if imps:
             file_imports[rel_path] = imps
 
+    # 6. Merge extra imports from context providers (Blade refs, route→controller, etc.)
+    if providers:
+        collect_extra_imports(providers, file_imports)
+
     return new_symbols, file_summaries, file_langs, file_imports, no_symbols_files
 
 
@@ -260,6 +264,10 @@ def parse_and_prepare_incremental(
         imps = extract_imports(content, rel_path, language)
         if imps:
             file_imports[rel_path] = imps
+
+    # 6. Merge extra imports from context providers (Blade refs, route→controller, etc.)
+    if providers:
+        collect_extra_imports(providers, file_imports)
 
     return new_symbols, file_summaries, file_langs, file_imports, no_symbols_files
 
@@ -390,5 +398,9 @@ def parse_and_prepare_full(
             imps = extract_imports(content, path, language)
             if imps:
                 file_imports[path] = imps
+
+    # 6. Merge extra imports from context providers (Blade refs, route→controller, etc.)
+    if providers:
+        collect_extra_imports(providers, file_imports)
 
     return all_symbols, file_summaries, languages, file_langs, file_imports, no_symbols_files

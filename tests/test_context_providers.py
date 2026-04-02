@@ -10,6 +10,7 @@ from jcodemunch_mcp.parser.context.base import (
     register_provider,
     discover_providers,
     enrich_symbols,
+    collect_extra_imports,
 )
 
 
@@ -262,3 +263,111 @@ class TestEnrichSymbols:
         sym = _make_symbol("source")
         enrich_symbols([sym], [])
         assert sym.ecosystem_context == ""
+
+
+# ===========================================================================
+# collect_extra_imports tests
+# ===========================================================================
+
+
+class _StubProviderWithImports(_StubProvider):
+    """Stub provider that also returns extra imports."""
+
+    def __init__(self, extra_imports=None, **kwargs):
+        super().__init__(**kwargs)
+        self._extra_imports = extra_imports or {}
+
+    def get_extra_imports(self):
+        return self._extra_imports
+
+
+class _FailingImportsProvider(_StubProvider):
+    """Provider whose get_extra_imports raises."""
+
+    def get_extra_imports(self):
+        raise RuntimeError("import extraction failed")
+
+
+class TestCollectExtraImports:
+
+    def test_merges_into_empty(self):
+        provider = _StubProviderWithImports(extra_imports={
+            "routes/web.php": [{"specifier": "UserController", "names": ["UserController"]}],
+        })
+        file_imports: dict[str, list[dict]] = {}
+        collect_extra_imports([provider], file_imports)
+
+        assert "routes/web.php" in file_imports
+        assert len(file_imports["routes/web.php"]) == 1
+        assert file_imports["routes/web.php"][0]["specifier"] == "UserController"
+
+    def test_merges_into_existing_without_duplicates(self):
+        provider = _StubProviderWithImports(extra_imports={
+            "app/Http/Controllers/UserController.php": [
+                {"specifier": "Illuminate\\Cache\\CacheManager", "names": ["Cache"]},
+            ],
+        })
+        # Pre-existing imports (from PHP use statement extraction)
+        file_imports = {
+            "app/Http/Controllers/UserController.php": [
+                {"specifier": "App\\Models\\User", "names": ["User"]},
+            ],
+        }
+        collect_extra_imports([provider], file_imports)
+
+        imports = file_imports["app/Http/Controllers/UserController.php"]
+        assert len(imports) == 2
+        specifiers = {i["specifier"] for i in imports}
+        assert "App\\Models\\User" in specifiers
+        assert "Illuminate\\Cache\\CacheManager" in specifiers
+
+    def test_deduplicates_same_specifier(self):
+        provider = _StubProviderWithImports(extra_imports={
+            "app/main.php": [
+                {"specifier": "App\\Models\\User", "names": ["User"]},
+            ],
+        })
+        file_imports = {
+            "app/main.php": [
+                {"specifier": "App\\Models\\User", "names": ["User"]},
+            ],
+        }
+        collect_extra_imports([provider], file_imports)
+
+        # Should NOT duplicate — still 1 import
+        assert len(file_imports["app/main.php"]) == 1
+
+    def test_multiple_providers(self):
+        p1 = _StubProviderWithImports(extra_imports={
+            "app/Service.php": [{"specifier": "Cache", "names": ["Cache"]}],
+        })
+        p2 = _StubProviderWithImports(extra_imports={
+            "app/Service.php": [{"specifier": "DB", "names": ["DB"]}],
+        })
+        file_imports: dict[str, list[dict]] = {}
+        collect_extra_imports([p1, p2], file_imports)
+
+        assert len(file_imports["app/Service.php"]) == 2
+
+    def test_failing_provider_does_not_crash(self):
+        good = _StubProviderWithImports(extra_imports={
+            "app/a.php": [{"specifier": "X", "names": []}],
+        })
+        bad = _FailingImportsProvider()
+        file_imports: dict[str, list[dict]] = {}
+        collect_extra_imports([bad, good], file_imports)
+
+        # Good provider's imports should still be present
+        assert "app/a.php" in file_imports
+
+    def test_empty_providers_list(self):
+        file_imports = {"a.php": [{"specifier": "X", "names": []}]}
+        collect_extra_imports([], file_imports)
+        assert len(file_imports["a.php"]) == 1
+
+    def test_provider_without_override_returns_empty(self):
+        """Base ContextProvider.get_extra_imports() returns {} by default."""
+        provider = _StubProvider()
+        file_imports: dict[str, list[dict]] = {}
+        collect_extra_imports([provider], file_imports)
+        assert file_imports == {}

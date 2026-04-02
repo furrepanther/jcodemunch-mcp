@@ -397,7 +397,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_symbol_source",
-            description="Get full source of one symbol (symbol_id → flat object) or many (symbol_ids[] → {symbols, errors}). Supports verify and context_lines.",
+            description="Get full source of one symbol (symbol_id → flat object) or many (symbol_ids[] → {symbols, errors}). Supports verify, context_lines, and fqn (PHP FQN via PSR-4).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -423,6 +423,10 @@ def _build_tools_list() -> list[Tool]:
                         "type": "integer",
                         "description": "Number of lines before/after symbol to include for context",
                         "default": 0
+                    },
+                    "fqn": {
+                        "type": "string",
+                        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol_id via PSR-4. Alternative to symbol_id."
                     }
                 },
                 "required": ["repo"]
@@ -537,6 +541,10 @@ def _build_tools_list() -> list[Tool]:
                         "type": "boolean",
                         "description": "Skip BM25 entirely and rank solely by embedding cosine similarity. Implies semantic=true.",
                         "default": False
+                    },
+                    "fqn": {
+                        "type": "string",
+                        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves via PSR-4 and uses the class name as query. Alternative to query."
                     }
                 },
                 "required": ["repo", "query"]
@@ -697,7 +705,8 @@ def _build_tools_list() -> list[Tool]:
             description=(
                 "Get full source + imports for one or more symbols in one call. "
                 "Multi-symbol bundles deduplicate shared imports. "
-                "Set token_budget to cap response size; use budget_strategy to control what's kept."
+                "Set token_budget to cap response size; use budget_strategy to control what's kept. "
+                "Supports fqn (PHP FQN via PSR-4) as alternative to symbol_id."
             ),
             inputSchema={
                 "type": "object",
@@ -744,6 +753,10 @@ def _build_tools_list() -> list[Tool]:
                         "type": "boolean",
                         "description": "When true, include a 'budget_report' field showing tokens used, symbols included/excluded, and strategy applied.",
                         "default": False
+                    },
+                    "fqn": {
+                        "type": "string",
+                        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol_id via PSR-4. Alternative to symbol_id."
                     }
                 },
                 "required": ["repo"]
@@ -886,6 +899,10 @@ def _build_tools_list() -> list[Tool]:
                         "type": "integer",
                         "description": "When > 0, also find symbols that *call* this symbol (call-level analysis). Returns a callers list alongside the import-level confirmed/potential. Max 3. Default 0 (disabled).",
                         "default": 0,
+                    },
+                    "fqn": {
+                        "type": "string",
+                        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol via PSR-4. Alternative to symbol."
                     },
                 },
                 "required": ["repo", "symbol"]
@@ -1679,6 +1696,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     verify=arguments.get("verify", False),
                     context_lines=arguments.get("context_lines", 0),
                     storage_path=storage_path,
+                    fqn=arguments.get("fqn"),
                 )
             )
         elif name == "search_symbols":
@@ -1707,6 +1725,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         semantic_weight=arguments.get("semantic_weight", 0.5),
                         semantic_only=arguments.get("semantic_only", False),
                         storage_path=storage_path,
+                        fqn=arguments.get("fqn"),
                     )
                 )
         elif name == "invalidate_cache":
@@ -1807,6 +1826,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     budget_strategy=arguments.get("budget_strategy", "most_relevant"),
                     include_budget_report=arguments.get("include_budget_report", False),
                     storage_path=storage_path,
+                    fqn=arguments.get("fqn"),
                 )
             )
         elif name == "get_ranked_context":
@@ -1864,6 +1884,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     storage_path=storage_path,
                     cross_repo=arguments.get("cross_repo"),
                     call_depth=arguments.get("call_depth", 0),
+                    fqn=arguments.get("fqn"),
                 )
             )
         elif name == "get_call_hierarchy":

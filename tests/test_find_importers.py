@@ -85,6 +85,114 @@ class TestExtractImportsJS:
         assert len(matching) == 1
 
 
+class TestVueTemplateImports:
+    """Test Vue <template> component extraction."""
+
+    def test_pascal_case_component(self):
+        content = """
+<template>
+  <UserTable :users="users" />
+  <Pagination :total="10" />
+</template>
+<script setup>
+const users = []
+</script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        specifiers = {r["specifier"] for r in result}
+        assert "UserTable" in specifiers
+        assert "Pagination" in specifiers
+
+    def test_kebab_case_component(self):
+        content = """
+<template>
+  <user-table />
+  <my-dialog />
+</template>
+<script setup></script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        specifiers = {r["specifier"] for r in result}
+        assert "UserTable" in specifiers
+        assert "MyDialog" in specifiers
+
+    def test_already_imported_not_duplicated(self):
+        content = """
+<template>
+  <UserTable />
+</template>
+<script setup>
+import UserTable from '@/components/UserTable.vue'
+</script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        user_table = [r for r in result if "UserTable" in r.get("names", [])]
+        # Only one entry — from the script import, not duplicated by template
+        assert len(user_table) == 1
+        assert user_table[0]["specifier"] == "@/components/UserTable.vue"
+
+    def test_html_elements_excluded(self):
+        content = """
+<template>
+  <div><span>text</span></div>
+  <button @click="go">Go</button>
+  <input type="text" />
+  <h1>Title</h1>
+</template>
+<script setup></script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        specifiers = {r["specifier"] for r in result}
+        assert "div" not in specifiers
+        assert "span" not in specifiers
+        assert "button" not in specifiers
+        assert "input" not in specifiers
+
+    def test_vue_builtins_excluded(self):
+        content = """
+<template>
+  <transition name="fade"><div/></transition>
+  <keep-alive><component :is="current"/></keep-alive>
+  <teleport to="body"><div/></teleport>
+</template>
+<script setup></script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        specifiers = {r["specifier"] for r in result}
+        assert "Transition" not in specifiers
+        assert "KeepAlive" not in specifiers
+        assert "Teleport" not in specifiers
+
+    def test_no_template_block(self):
+        content = """
+<script setup>
+import Foo from './Foo'
+const x = 1
+</script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        assert len(result) == 1
+        assert result[0]["specifier"] == "./Foo"
+
+    def test_mixed_imported_and_template_only(self):
+        content = """
+<template>
+  <ImportedComponent />
+  <TemplateOnly />
+</template>
+<script setup>
+import ImportedComponent from './ImportedComponent.vue'
+</script>
+"""
+        result = extract_imports(content, "src/App.vue", "vue")
+        specifiers = {r["specifier"] for r in result}
+        assert "./ImportedComponent.vue" in specifiers
+        assert "TemplateOnly" in specifiers
+        # ImportedComponent should NOT appear as a synthetic edge
+        synthetic = [r for r in result if r["specifier"] == "ImportedComponent"]
+        assert len(synthetic) == 0
+
+
 class TestExtractImportsPython:
     """Test Python import extraction."""
 
@@ -1042,3 +1150,174 @@ class TestImportsPersistence:
         index = store.load_index(owner, name)
         assert "app.js" in index.imports
         assert "new_importer.js" in index.imports
+
+
+class TestLaravelExtraImportsPipeline:
+    """Integration: verify that Laravel provider extra imports flow through the pipeline."""
+
+    def test_blade_imports_in_index(self, tmp_path):
+        """Blade @extends/@include create import edges visible in the stored index."""
+        import json
+        store_path = tmp_path / "store"
+
+        # Create minimal Laravel project
+        _write(tmp_path / "artisan", "#!/usr/bin/env php\n<?php\n")
+        _write(tmp_path / "composer.json", json.dumps({
+            "require": {"laravel/framework": "^11.0"},
+            "autoload": {"psr-4": {"App\\": "app/"}},
+        }))
+        _write(tmp_path / "resources" / "views" / "layouts" / "app.blade.php",
+               "<!DOCTYPE html><html>@yield('content')</html>")
+        _write(tmp_path / "resources" / "views" / "home.blade.php",
+               "@extends('layouts.app')\n@section('content')\n<h1>Home</h1>\n@endsection")
+        # Need at least one PHP file with symbols for the index to work
+        _write(tmp_path / "app" / "Models" / "User.php",
+               "<?php\nnamespace App\\Models;\nclass User extends Model {}\n")
+
+        result = index_folder(str(tmp_path), use_ai_summaries=False,
+                              storage_path=str(store_path))
+        assert result["success"] is True
+
+        store = IndexStore(base_path=str(store_path))
+        owner, name = result["repo"].split("/", 1)
+        index = store.load_index(owner, name)
+
+        # Blade file should have an import edge to layouts/app
+        blade_imports = index.imports.get("resources/views/home.blade.php", [])
+        specifiers = {imp["specifier"] for imp in blade_imports}
+        assert "resources/views/layouts/app.blade.php" in specifiers
+
+    def test_facade_imports_in_index(self, tmp_path):
+        """Facade static calls create import edges to Illuminate classes."""
+        import json
+        store_path = tmp_path / "store"
+
+        _write(tmp_path / "artisan", "#!/usr/bin/env php\n<?php\n")
+        _write(tmp_path / "composer.json", json.dumps({
+            "require": {"laravel/framework": "^11.0"},
+            "autoload": {"psr-4": {"App\\": "app/"}},
+        }))
+        _write(tmp_path / "app" / "Services" / "OrderService.php", r"""<?php
+namespace App\Services;
+
+class OrderService
+{
+    public function process()
+    {
+        Cache::put('key', 'value');
+        DB::table('orders')->get();
+    }
+}
+""")
+
+        result = index_folder(str(tmp_path), use_ai_summaries=False,
+                              storage_path=str(store_path))
+        assert result["success"] is True
+
+        store = IndexStore(base_path=str(store_path))
+        owner, name = result["repo"].split("/", 1)
+        index = store.load_index(owner, name)
+
+        svc_imports = index.imports.get("app/Services/OrderService.php", [])
+        specifiers = {imp["specifier"] for imp in svc_imports}
+        assert "Illuminate\\Cache\\CacheManager" in specifiers
+        assert "Illuminate\\Database\\DatabaseManager" in specifiers
+
+    def test_eloquent_relationship_imports_in_index(self, tmp_path):
+        """Eloquent relationship calls create import edges between models."""
+        import json
+        store_path = tmp_path / "store"
+
+        _write(tmp_path / "artisan", "#!/usr/bin/env php\n<?php\n")
+        _write(tmp_path / "composer.json", json.dumps({
+            "require": {"laravel/framework": "^11.0"},
+            "autoload": {"psr-4": {"App\\": "app/"}},
+        }))
+        _write(tmp_path / "app" / "Models" / "User.php", r"""<?php
+namespace App\Models;
+class User extends Model
+{
+    public function posts() { return $this->hasMany(Post::class); }
+}
+""")
+        _write(tmp_path / "app" / "Models" / "Post.php", r"""<?php
+namespace App\Models;
+class Post extends Model {}
+""")
+
+        result = index_folder(str(tmp_path), use_ai_summaries=False,
+                              storage_path=str(store_path))
+        assert result["success"] is True
+
+        store = IndexStore(base_path=str(store_path))
+        owner, name = result["repo"].split("/", 1)
+        index = store.load_index(owner, name)
+
+        user_imports = index.imports.get("app/Models/User.php", [])
+        specifiers = {imp["specifier"] for imp in user_imports}
+        assert "Post" in specifiers
+
+    def test_inertia_imports_in_index(self, tmp_path):
+        """Inertia::render creates import edges from controllers to Vue pages."""
+        import json
+        store_path = tmp_path / "store"
+
+        _write(tmp_path / "artisan", "#!/usr/bin/env php\n<?php\n")
+        _write(tmp_path / "composer.json", json.dumps({
+            "require": {"laravel/framework": "^11.0", "inertiajs/inertia-laravel": "^1.0"},
+            "autoload": {"psr-4": {"App\\": "app/"}},
+        }))
+        _write(tmp_path / "app" / "Http" / "Controllers" / "UserController.php", r"""<?php
+namespace App\Http\Controllers;
+use Inertia\Inertia;
+class UserController extends Controller
+{
+    public function index() { return Inertia::render('Users/Index', ['users' => []]); }
+}
+""")
+        (tmp_path / "resources" / "js" / "Pages" / "Users").mkdir(parents=True)
+        _write(tmp_path / "resources" / "js" / "Pages" / "Users" / "Index.vue",
+               "<template><div>Users</div></template>")
+
+        result = index_folder(str(tmp_path), use_ai_summaries=False,
+                              storage_path=str(store_path))
+        assert result["success"] is True
+
+        store = IndexStore(base_path=str(store_path))
+        owner, name = result["repo"].split("/", 1)
+        index = store.load_index(owner, name)
+
+        ctrl_imports = index.imports.get("app/Http/Controllers/UserController.php", [])
+        specifiers = {imp["specifier"] for imp in ctrl_imports}
+        assert "resources/js/Pages/Users/Index.vue" in specifiers
+
+    def test_vue_template_components_in_index(self, tmp_path):
+        """Vue <template> component usage creates synthetic import edges."""
+        store_path = tmp_path / "store"
+
+        _write(tmp_path / "src" / "components" / "UserTable.vue",
+               "<template><table></table></template>\n<script setup></script>")
+        _write(tmp_path / "src" / "App.vue", """
+<template>
+  <UserTable />
+  <NavBar />
+</template>
+<script setup>
+import UserTable from './components/UserTable.vue'
+</script>
+""")
+
+        result = index_folder(str(tmp_path), use_ai_summaries=False,
+                              storage_path=str(store_path))
+        assert result["success"] is True
+
+        store = IndexStore(base_path=str(store_path))
+        owner, name = result["repo"].split("/", 1)
+        index = store.load_index(owner, name)
+
+        app_imports = index.imports.get("src/App.vue", [])
+        specifiers = {imp["specifier"] for imp in app_imports}
+        # UserTable imported in <script> — should appear
+        assert "./components/UserTable.vue" in specifiers
+        # NavBar only in <template>, not imported — synthetic edge
+        assert "NavBar" in specifiers

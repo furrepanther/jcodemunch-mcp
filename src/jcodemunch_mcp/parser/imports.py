@@ -293,12 +293,100 @@ def _extract_sql_dbt_imports(content: str) -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Vue <template> component extraction
+# ---------------------------------------------------------------------------
+
+_VUE_TEMPLATE_BLOCK = re.compile(r"<template\b[^>]*>(.*)</template>", re.DOTALL)
+
+_VUE_TEMPLATE_COMPONENT = re.compile(
+    r"""<(?P<tag>[A-Z][\w]*|[a-z]+-[\w-]+)[\s/>]""",
+    re.MULTILINE,
+)
+
+_HTML_STANDARD_ELEMENTS = frozenset({
+    # HTML5 elements
+    "a", "abbr", "address", "area", "article", "aside", "audio",
+    "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button",
+    "canvas", "caption", "cite", "code", "col", "colgroup",
+    "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl", "dt",
+    "em", "embed",
+    "fieldset", "figcaption", "figure", "footer", "form",
+    "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html",
+    "i", "iframe", "img", "input", "ins",
+    "kbd",
+    "label", "legend", "li", "link",
+    "main", "map", "mark", "menu", "meta", "meter",
+    "nav", "noscript",
+    "object", "ol", "optgroup", "option", "output",
+    "p", "param", "picture", "pre", "progress",
+    "q",
+    "rp", "rt", "ruby",
+    "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span",
+    "strong", "style", "sub", "summary", "sup",
+    "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track",
+    "u", "ul",
+    "var", "video",
+    "wbr",
+    # SVG elements
+    "svg", "path", "circle", "rect", "line", "g", "defs", "use", "text",
+    "polygon", "polyline", "ellipse", "image", "mask", "pattern",
+    # Vue built-in elements
+    "transition", "transition-group", "keep-alive", "teleport", "suspense", "component",
+})
+
+
+def _kebab_to_pascal(name: str) -> str:
+    """Convert kebab-case to PascalCase: 'user-table' → 'UserTable'."""
+    return "".join(part.capitalize() for part in name.split("-"))
+
+
+def _extract_vue_template_components(content: str) -> list[str]:
+    """Extract component names used in Vue <template> blocks."""
+    m = _VUE_TEMPLATE_BLOCK.search(content)
+    if not m:
+        return []
+    template = m.group(1)
+
+    components: set[str] = set()
+    for cm in _VUE_TEMPLATE_COMPONENT.finditer(template):
+        tag = cm.group("tag")
+        # Normalize to lowercase for HTML check
+        if tag.lower() not in _HTML_STANDARD_ELEMENTS:
+            components.add(tag)
+    return sorted(components)
+
+
+def _extract_vue_imports(content: str) -> list[dict]:
+    """Extract imports from Vue SFC: script imports + template component usage."""
+    edges = _extract_js_imports(content)
+
+    template_components = _extract_vue_template_components(content)
+    if not template_components:
+        return edges
+
+    # Collect already-imported names from <script> for dedup
+    imported_names: set[str] = set()
+    for edge in edges:
+        imported_names.update(edge["names"])
+
+    for component in template_components:
+        # Check if already imported (PascalCase or kebab→PascalCase)
+        pascal = _kebab_to_pascal(component) if "-" in component else component
+        if component in imported_names or pascal in imported_names:
+            continue
+        # Synthetic import edge for template-only component usage
+        edges.append({"specifier": pascal, "names": [pascal]})
+
+    return edges
+
+
 _LANGUAGE_EXTRACTORS = {
     "javascript": _extract_js_imports,
     "typescript": _extract_js_imports,
     "tsx": _extract_js_imports,
     "jsx": _extract_js_imports,
-    "vue": _extract_js_imports,
+    "vue": _extract_vue_imports,
     "python": _extract_python_imports,
     "go": _extract_go_imports,
     "java": lambda c: _extract_java_imports(c, "java"),

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 from .. import config as _config
 from ..parser import parse_file, LANGUAGE_EXTENSIONS, get_language_for_path
-from ..parser.context import discover_providers, enrich_symbols, collect_metadata
+from ..parser.context import discover_providers, enrich_symbols, collect_metadata, collect_extra_imports
 from ..parser.context.framework_profiles import detect_framework, profile_to_meta
 from ..parser.imports import extract_imports, _alias_map_cache as _imap_cache
 from ..security import (
@@ -1048,6 +1048,10 @@ def index_folder(
         # Enrich with context providers before summarization
         if active_providers and all_symbols:
             enrich_symbols(all_symbols, active_providers)
+
+        # Merge extra imports from context providers (Blade refs, facades, etc.)
+        if active_providers:
+            collect_extra_imports(active_providers, file_imports)
 
         # Generate summaries — preserve existing summaries for unchanged files
         if all_symbols:

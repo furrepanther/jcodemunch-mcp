@@ -6,7 +6,7 @@ import time
 from typing import Optional
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided as _cost_avoided
-from ._utils import resolve_repo
+from ._utils import resolve_repo, resolve_fqn
 
 
 def _make_meta(timing_ms: float, **kwargs) -> dict:
@@ -23,18 +23,27 @@ def get_symbol_source(
     verify: bool = False,
     context_lines: int = 0,
     storage_path: Optional[str] = None,
+    fqn: Optional[str] = None,
 ) -> dict:
     """Get full source of one or more symbols by ID.
 
     Pass symbol_id (string) for one symbol — returns flat symbol object.
     Pass symbol_ids (array) for batch — returns {symbols, errors}.
     Both modes support verify and context_lines.
+    Pass fqn (PHP FQN like 'App\\Models\\User') to resolve via PSR-4.
     """
+    # FQN resolution: translate PHP FQN → symbol_id
+    if fqn and symbol_id is None and symbol_ids is None:
+        resolved, fqn_error = resolve_fqn(repo, fqn, storage_path)
+        if resolved is None:
+            return {"error": fqn_error or f"Could not resolve FQN '{fqn}'."}
+        symbol_id = resolved
+
     # Normalize: some MCP clients send symbol_ids=[] alongside symbol_id when they mean singular mode
     if symbol_id is not None and symbol_ids is not None and len(symbol_ids) == 0:
         symbol_ids = None
     if symbol_id is None and symbol_ids is None:
-        return {"error": "Provide symbol_id (string) or symbol_ids (array)."}
+        return {"error": "Provide symbol_id (string), symbol_ids (array), or fqn (PHP FQN)."}
     if symbol_id is not None and symbol_ids is not None:
         return {"error": "Provide symbol_id or symbol_ids, not both."}
 

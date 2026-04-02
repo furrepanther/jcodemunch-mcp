@@ -1,8 +1,11 @@
 """Shared helpers for tool modules."""
 
+import logging
 from typing import Optional
 
 from ..storage import IndexStore
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bare-name resolution cache (P5)
@@ -64,3 +67,32 @@ def resolve_repo(repo: str, storage_path: Optional[str] = None) -> tuple[str, st
         )
 
     return candidates[0].split("/", 1)
+
+
+def resolve_fqn(
+    repo: str, fqn: str, storage_path: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a PHP FQN to a jcodemunch symbol_id.
+
+    Returns ``(symbol_id, None)`` on success or ``(None, error_message)`` on failure.
+    """
+    from ..parser.fqn import fqn_to_symbol
+    from ..parser.imports import build_psr4_map
+
+    try:
+        owner, name = resolve_repo(repo, storage_path)
+    except ValueError as e:
+        return None, f"Repository not found: {e}"
+    store = IndexStore(base_path=storage_path)
+    index = store.load_index(owner, name)
+    if not index:
+        return None, f"Repository not indexed: {owner}/{name}"
+    if not getattr(index, "source_root", None):
+        return None, "Index has no source_root (remote indexes don't support FQN resolution)"
+    psr4 = build_psr4_map(index.source_root)
+    if not psr4:
+        return None, "No PSR-4 autoload config found in composer.json"
+    resolved = fqn_to_symbol(fqn, psr4, frozenset(index.source_files))
+    if not resolved:
+        return None, f"FQN '{fqn}' could not be resolved. File not in index or namespace mismatch."
+    return resolved, None
