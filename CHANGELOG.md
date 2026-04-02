@@ -4,6 +4,11 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.21.6] - 2026-04-02
+
+### Fixed
+- **`_REPO_PATH_CACHE` negative entries no longer permanently suppress project config (C2)** — `_resolve_repo_key` previously wrote `None` into `_REPO_PATH_CACHE` for any identifier that couldn't be resolved at call time (e.g. during watcher startup before the first index completes). That entry was never invalidated, so all subsequent calls — including those after successful indexing — silently fell through to the global config, ignoring `.jcodemunch.jsonc` for the process lifetime. Removed the negative cache write; unknown identifiers now re-scan `list_repos()` on each call (cheap read) so project configs are picked up as soon as the repo is indexed.
+
 ## [1.21.5] - 2026-04-02
 
 ### Fixed

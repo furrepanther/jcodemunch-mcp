@@ -671,8 +671,6 @@ def _resolve_repo_key(repo: str) -> str | None:
                 return resolved
     except Exception:
         pass
-    # Negative cache: avoids repeated IndexStore scans for unknown identifiers
-    _REPO_PATH_CACHE[repo] = None  # type: ignore[assignment]
     return None
 
 
