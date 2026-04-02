@@ -4,6 +4,12 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-04-02
+
+### Added
+- **CSS symbol extraction** — CSS files now produce real symbols: rule-set selectors (`.container`, `#header`, `body`, `:root`, compound selectors like `.navbar .item`) are extracted as `kind: class`; `@keyframes` as `kind: function`; `@media` and `@supports` blocks as `kind: type`. Previously CSS was indexed (text-searchable) but `get_file_outline` always returned 0 symbols. Fixes reported issue where users believed CSS was not supported at all.
+- **17 new tests** (1641 total, 7 skipped): full coverage of CSS selector extraction, @-rule extraction, edge cases (empty file, comment-only file), symbol ID uniqueness, and `parse_file()` dispatch.
+
 ## [1.20.0] - 2026-04-02
 
 ### Changed

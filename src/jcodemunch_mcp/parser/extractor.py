@@ -91,7 +91,9 @@ def parse_file(content: str, filename: str, language: str, source_bytes: Optiona
     elif language == "openapi":
         symbols = _parse_openapi_symbols(source_bytes, filename)
     elif language == "al":
-        symbols = _parse_al_symbols(source_bytes, filename)        
+        symbols = _parse_al_symbols(source_bytes, filename)
+    elif language == "css":
+        symbols = _parse_css_symbols(source_bytes, filename)
     else:
         spec = LANGUAGE_REGISTRY[language]
         symbols = _parse_with_spec(source_bytes, filename, language, spec)
@@ -5084,6 +5086,80 @@ def _parse_graphql_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
             _walk(child)
 
     _walk(tree.root_node)
+    return symbols
+
+
+def _parse_css_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Parse CSS files and extract rule sets, @keyframes, @media, and @supports as symbols.
+
+    Extracted symbol kinds:
+    - rule_set selectors  → kind "class"    (e.g. ``.container``, ``#header``, ``body``)
+    - @keyframes          → kind "function" (e.g. ``@keyframes slideIn``)
+    - @media / @supports  → kind "type"     (e.g. ``@media (max-width: 768px)``)
+    """
+    try:
+        parser = get_parser("css")
+    except Exception:
+        return []
+
+    tree = parser.parse(source_bytes)
+    symbols: list[Symbol] = []
+
+    def _text(node) -> str:
+        return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def _selector_name(selectors_node) -> str:
+        """Return a concise, stable selector string (≤80 chars)."""
+        raw = _text(selectors_node).strip()
+        # Collapse internal whitespace sequences to a single space
+        raw = " ".join(raw.split())
+        return raw[:80] if len(raw) > 80 else raw
+
+    def _make(name: str, kind: str, node, signature: str) -> Symbol:
+        return Symbol(
+            id=make_symbol_id(filename, name, kind),
+            file=filename,
+            name=name,
+            qualified_name=name,
+            kind=kind,
+            language="css",
+            signature=signature,
+            line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            byte_offset=node.start_byte,
+            byte_length=node.end_byte - node.start_byte,
+            content_hash=compute_content_hash(source_bytes[node.start_byte:node.end_byte]),
+        )
+
+    for node in tree.root_node.children:
+        if node.type == "rule_set":
+            selectors_node = next((c for c in node.children if c.type == "selectors"), None)
+            if selectors_node is None:
+                continue
+            name = _selector_name(selectors_node)
+            if not name:
+                continue
+            symbols.append(_make(name, "class", node, name))
+
+        elif node.type == "keyframes_statement":
+            name_node = next((c for c in node.children if c.type == "keyframes_name"), None)
+            if name_node is None:
+                continue
+            kf_name = _text(name_node).strip()
+            if not kf_name:
+                continue
+            full_name = f"@keyframes {kf_name}"
+            symbols.append(_make(full_name, "function", node, full_name))
+
+        elif node.type in ("media_statement", "supports_statement"):
+            # Use first line stripped of trailing '{' as the name/signature
+            first_line = _text(node).split("\n")[0].strip().rstrip("{").strip()
+            if len(first_line) > 80:
+                first_line = first_line[:77] + "..."
+            if not first_line:
+                continue
+            symbols.append(_make(first_line, "type", node, first_line))
+
     return symbols
 
 
