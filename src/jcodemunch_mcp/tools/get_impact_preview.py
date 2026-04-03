@@ -155,6 +155,8 @@ def get_impact_preview(
         ],
         "_meta": {
             "timing_ms": round(elapsed, 1),
+            "methodology": "text_heuristic",
+            "confidence_level": "low",
             "source": "text_heuristic",
             "tip": (
                 "Text-heuristic: shows every symbol that transitively calls this one "

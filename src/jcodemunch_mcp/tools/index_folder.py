@@ -20,7 +20,7 @@ from .. import config as _config
 from ..parser import parse_file, LANGUAGE_EXTENSIONS, get_language_for_path
 from ..parser.context import discover_providers, enrich_symbols, collect_metadata
 from ..parser.context.framework_profiles import detect_framework, profile_to_meta
-from ..parser.imports import extract_imports, _alias_map_cache as _imap_cache
+from ..parser.imports import extract_imports, _alias_map_cache as _imap_cache, _LANGUAGE_EXTRACTORS as _IMPORT_EXTRACTORS
 from ..security import (
     validate_path,
     is_symlink_escape,
@@ -1017,6 +1017,7 @@ def index_folder(
         content_dir.mkdir(parents=True, exist_ok=True)
 
         no_symbols_files: list[str] = []
+        _languages_with_symbols: set[str] = set()
         for rel_path in source_file_list:
             content = _read_file(rel_path)
             if content is None:
@@ -1042,6 +1043,7 @@ def index_folder(
                 if symbols:
                     all_symbols.extend(symbols)
                     symbols_by_file[rel_path].extend(symbols)
+                    _languages_with_symbols.add(language)
                 else:
                     no_symbols_files.append(rel_path)
                     logger.debug("NO SYMBOLS: %s", rel_path)
@@ -1147,6 +1149,12 @@ def index_folder(
             package_names=_pkg_names,
         )
 
+        # Identify languages that were indexed (symbols found) but have no import extractor
+        _missing_import_extractors = sorted(
+            lang for lang in _languages_with_symbols
+            if lang not in _IMPORT_EXTRACTORS
+        )
+
         result = {
             "success": True,
             "repo": index.repo,
@@ -1162,6 +1170,12 @@ def index_folder(
             "no_symbols_count": len(no_symbols_files),
             "no_symbols_files": no_symbols_files[:50],  # Show up to 50 for inspection
         }
+        if _missing_import_extractors:
+            result["missing_extractors"] = _missing_import_extractors
+            result.setdefault("parse_warnings", []).append(
+                f"Import graph incomplete for: {', '.join(_missing_import_extractors)}. "
+                "Dead code and dependency analysis may be less accurate for these languages."
+            )
 
         # Report context enrichment stats from all active providers
         if active_providers:

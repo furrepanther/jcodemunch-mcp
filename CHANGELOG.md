@@ -4,6 +4,16 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.21.19] - 2026-04-02
+
+### Added
+- **Methodology disclosure on all 6 analytical tools (T15)** — every analytical tool response now includes `_meta.methodology` and `_meta.confidence_level`. Values: `get_call_hierarchy` + `get_impact_preview` → `methodology: "text_heuristic"`, `confidence_level: "low"`; `get_symbol_complexity` → `methodology: "stored_metrics"`, `confidence_level: "medium"`; `get_churn_rate` → `methodology: "git_log"`, `confidence_level: "high"`; `get_hotspots` → `methodology: "complexity_x_churn"`, `confidence_level: "medium"`; `get_repo_health` → `methodology: "aggregate"`, `confidence_level: "medium"`; `get_dead_code_v2` → `methodology: "multi_signal"`, `confidence_level: "medium"`. 18 new tests in `tests/test_meta_disclosure.py`.
+- **Import-gap signal in `index_folder` (T17)** — `index_folder` now reports `missing_extractors` (sorted list of languages that have symbol extraction but no import extractor) and `parse_warnings` when import graph coverage is incomplete. Example: indexing a folder with `.dart` files yields `missing_extractors: ["dart"]` and a human-readable `parse_warnings` entry. 4 new tests in `tests/test_parse_warnings.py`.
+- **`framework_warning` in `get_dead_code_v2` (T18)** — when BFS finds zero standard entry points (`main.py`, `app.py`, etc.), all files are unreachable from entry points and Signal 1 fires for every symbol, inflating dead code counts. `get_dead_code_v2` now includes `framework_warning` in that case, advising callers to pass `entry_point_patterns`. 5 new tests in `tests/test_parse_warnings.py`.
+
+### Fixed
+- **Parameter count off-by-one for C-style zero-param functions (T16)** — `_count_params` in `parser/complexity.py` treated `void foo(void)` as a one-parameter function because `"void"` was a non-empty `params_str` with no commas, yielding `commas + 1 = 1`. Added a special case: `params_str == "void"` → return 0, matching the C/C++ convention that `(void)` declares zero parameters. `void*` and multi-param signatures containing `void` are unaffected. 3 new tests in `tests/test_complexity.py`.
+
 ## [1.21.18] - 2026-04-02
 
 ### Added
