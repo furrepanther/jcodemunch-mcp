@@ -4,6 +4,11 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.22.2] - 2026-04-05
+
+### Fixed
+- **CLI init indexing broken** — `run_index()` passed `folder_path=` to `index_folder()` which expects `path=`, causing `unexpected keyword argument` error on `jcodemunch-mcp init`. Closes #208.
+
 ## [1.22.1] - 2026-04-05
 
 ### Fixed
