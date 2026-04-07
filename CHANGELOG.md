@@ -2,6 +2,11 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.23.3] — 2026-04-07
+
+### Fixed
+- Tests: 6 `index_folder()` calls in `test_negative_evidence.py` were leaking index files into `~/.code-index/` instead of pytest's `tmp_path` (#222, @MariusAdrian88)
+
 ## [1.23.2] — 2026-04-07
 
 ### Added
