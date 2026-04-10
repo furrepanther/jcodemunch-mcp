@@ -189,6 +189,99 @@ def _callees_from_references(
     return results
 
 
+def _lsp_callers(index: "CodeIndex", sym: dict, symbols_by_file: dict[str, list[dict]]) -> list[dict]:
+    """Return callers from LSP-resolved edges stored in context_metadata."""
+    lsp_edges = (getattr(index, "context_metadata", None) or {}).get("lsp_edges", [])
+    if not lsp_edges:
+        return []
+
+    sym_name = sym.get("name", "")
+    sym_file = sym.get("file", "")
+    if not sym_name or not sym_file:
+        return []
+
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+    symbol_index: dict[str, dict] = getattr(index, "_symbol_index", {})
+
+    for edge in lsp_edges:
+        # An LSP edge says: from caller_file, something called called_name,
+        # and LSP resolved it to target_file:target_line.
+        if edge.get("called_name") != sym_name:
+            continue
+        if edge.get("target_file") != sym_file:
+            continue
+        caller_file = edge.get("caller_file", "")
+        if not caller_file:
+            continue
+        # Find the caller symbol in caller_file
+        for candidate in symbols_by_file.get(caller_file, []):
+            cid = candidate.get("id", "")
+            if not cid or cid in seen_ids:
+                continue
+            # Check if the caller's line range encompasses the call site
+            # (approximate: any symbol in that file that has this call_reference)
+            call_refs = candidate.get("call_references", [])
+            if sym_name in call_refs:
+                seen_ids.add(cid)
+                results.append({
+                    "id": cid,
+                    "name": candidate.get("name", ""),
+                    "kind": candidate.get("kind", ""),
+                    "file": caller_file,
+                    "line": candidate.get("line", 0),
+                    "resolution": "lsp_resolved",
+                })
+    return results
+
+
+def _lsp_callees(index: "CodeIndex", sym: dict, symbols_by_file: dict[str, list[dict]]) -> list[dict]:
+    """Return callees from LSP-resolved edges stored in context_metadata."""
+    lsp_edges = (getattr(index, "context_metadata", None) or {}).get("lsp_edges", [])
+    if not lsp_edges:
+        return []
+
+    sym_name = sym.get("name", "")
+    sym_file = sym.get("file", "")
+    if not sym_name or not sym_file:
+        return []
+
+    call_refs = sym.get("call_references", [])
+    if not call_refs:
+        return []
+
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for edge in lsp_edges:
+        if edge.get("caller_file") != sym_file:
+            continue
+        called_name = edge.get("called_name", "")
+        if called_name not in call_refs:
+            continue
+        target_file = edge.get("target_file", "")
+        target_line = edge.get("target_line", 0)
+        if not target_file:
+            continue
+        # Find the target symbol
+        for candidate in symbols_by_file.get(target_file, []):
+            cid = candidate.get("id", "")
+            if not cid or cid in seen_ids:
+                continue
+            if candidate.get("name") == called_name:
+                seen_ids.add(cid)
+                results.append({
+                    "id": cid,
+                    "name": called_name,
+                    "kind": candidate.get("kind", ""),
+                    "file": target_file,
+                    "line": candidate.get("line", 0),
+                    "resolution": "lsp_resolved",
+                })
+                break  # Take the first match for this called_name in target_file
+    return results
+
+
 def find_direct_callers(
     index: "CodeIndex",
     store: "IndexStore",
@@ -200,9 +293,13 @@ def find_direct_callers(
 ) -> list[dict]:
     """Return symbols in importing files whose bodies mention *sym*'s name.
 
-    Each result is ``{id, name, kind, file, line}``.
+    Each result is ``{id, name, kind, file, line, resolution}``.
     """
-    # Try AST-derived call_references first (when available and non-empty)
+    # LSP-resolved callers take highest priority
+    lsp_callers = _lsp_callers(index, sym, symbols_by_file)
+    lsp_ids: set[str] = {c["id"] for c in lsp_callers}
+
+    # Try AST-derived call_references (when available and non-empty)
     get_callers = getattr(index, "get_callers_by_name", None)
     callers_by_name = get_callers() if get_callers else None
     ast_caller_ids: set[str] = set()
@@ -211,17 +308,21 @@ def find_direct_callers(
         ast_callers = _callers_from_references(index, sym, reverse_adj)
         if ast_callers:
             for c in ast_callers:
-                ast_caller_ids.add(c["id"])
+                if c["id"] not in lsp_ids:
+                    ast_caller_ids.add(c["id"])
+            # Filter out duplicates with LSP
+            ast_callers = [c for c in ast_callers if c["id"] not in lsp_ids]
 
     # Always use text heuristic as fallback (handles partial AST data)
     sym_name: str = sym.get("name", "")
     sym_file: str = sym.get("file", "")
     if not sym_name or not sym_file:
-        return [{"id": c["id"], "name": c["name"], "kind": c["kind"],
-                 "file": c["file"], "line": c["line"]} for c in ast_callers] if ast_caller_ids else []
+        if lsp_callers or ast_caller_ids:
+            return lsp_callers + ast_callers
+        return []
 
     callers: list[dict] = []
-    seen_ids: set[str] = set(ast_caller_ids)
+    seen_ids: set[str] = set(ast_caller_ids) | lsp_ids
 
     for imp_file in reverse_adj.get(sym_file, []):
         file_content = store.get_file_content(owner, repo_name, imp_file)
@@ -248,7 +349,7 @@ def find_direct_callers(
                     "resolution": "text_matched",
                 })
 
-    return ast_callers + callers
+    return lsp_callers + ast_callers + callers
 
 
 def find_direct_callees(
@@ -261,28 +362,38 @@ def find_direct_callees(
 ) -> list[dict]:
     """Return symbols from imported files whose names appear in *sym*'s body.
 
-    Each result is ``{id, name, kind, file, line}``.
+    Each result is ``{id, name, kind, file, line, resolution}``.
     """
+    # LSP-resolved callees take highest priority
+    lsp_callees = _lsp_callees(index, sym, symbols_by_file)
+    lsp_ids: set[str] = {c["id"] for c in lsp_callees}
+
     # Fast path: use AST-derived call_references if available
     call_refs = sym.get("call_references", [])
     if call_refs:
-        return _callees_from_references(index, sym, symbols_by_file)
+        ast_callees = _callees_from_references(index, sym, symbols_by_file)
+        # Merge: LSP results override AST results for same symbol
+        merged = list(lsp_callees)
+        for c in ast_callees:
+            if c["id"] not in lsp_ids:
+                merged.append(c)
+        return merged
 
     # Fallback: text heuristic
     from ..parser.imports import resolve_specifier
 
     sym_file: str = sym.get("file", "")
     if not sym_file:
-        return []
+        return list(lsp_callees)
 
     file_content = store.get_file_content(owner, repo_name, sym_file)
     if not file_content:
-        return []
+        return list(lsp_callees)
 
     file_lines = file_content.splitlines()
     sym_body = _symbol_body(file_lines, sym)
     if not sym_body:
-        return []
+        return list(lsp_callees)
 
     # Resolve files that sym's file imports
     file_imports = (index.imports or {}).get(sym_file, [])
@@ -297,7 +408,7 @@ def find_direct_callees(
             imported_files.add(target)
 
     callees: list[dict] = []
-    seen_ids: set[str] = set()
+    seen_ids: set[str] = set(lsp_ids)
 
     for imported_file in imported_files:
         for candidate in symbols_by_file.get(imported_file, []):
@@ -316,7 +427,7 @@ def find_direct_callees(
                     "resolution": "text_matched",
                 })
 
-    return callees
+    return list(lsp_callees) + callees
 
 
 # ---------------------------------------------------------------------------

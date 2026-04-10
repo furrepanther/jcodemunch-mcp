@@ -979,6 +979,25 @@ def index_folder(
             git_head = _get_git_head(folder_path) or ""
             incr_context_metadata = collect_metadata(active_providers) if active_providers else None
 
+            # ── Optional LSP enrichment (incremental path) ──
+            try:
+                from ..enrichment.lsp_bridge import is_lsp_enabled, enrich_call_graph_with_lsp
+                if is_lsp_enabled(repo=str(folder_path)):
+                    lsp_edges = enrich_call_graph_with_lsp(
+                        root_path=str(folder_path),
+                        symbols=new_symbols,
+                        file_contents=raw_files_subset,
+                        file_languages=incr_file_languages,
+                        repo=str(folder_path),
+                    )
+                    if lsp_edges:
+                        if incr_context_metadata is None:
+                            incr_context_metadata = {}
+                        incr_context_metadata["lsp_edges"] = lsp_edges
+                        logger.info("LSP enrichment added %d edges (incremental)", len(lsp_edges))
+            except Exception:
+                logger.debug("LSP enrichment skipped (incremental)", exc_info=True)
+
             updated = store.incremental_save(
                 owner=owner, name=repo_name,
                 changed_files=changed, new_files=new, deleted_files=deleted,
@@ -1137,6 +1156,27 @@ def index_folder(
             _pkg_names = _extract_package_names(str(folder_path))
         except Exception:
             logger.debug("extract_package_names failed for %s", folder_path, exc_info=True)
+
+        # ── Optional LSP enrichment ──
+        # When enabled, resolve unqualified call sites via language servers.
+        # Results are stored in context_metadata["lsp_edges"] for the call graph.
+        try:
+            from ..enrichment.lsp_bridge import is_lsp_enabled, enrich_call_graph_with_lsp
+            if is_lsp_enabled(repo=str(folder_path)):
+                lsp_edges = enrich_call_graph_with_lsp(
+                    root_path=str(folder_path),
+                    symbols=all_symbols,
+                    file_contents={},  # full path: LSP bridge reads from disk
+                    file_languages=file_languages,
+                    repo=str(folder_path),
+                )
+                if lsp_edges:
+                    if full_context_metadata is None:
+                        full_context_metadata = {}
+                    full_context_metadata["lsp_edges"] = lsp_edges
+                    logger.info("LSP enrichment added %d edges", len(lsp_edges))
+        except Exception:
+            logger.debug("LSP enrichment skipped", exc_info=True)
 
         # Save index — raw files already written to content dir above,
         # pass empty dict to skip duplicate writes.

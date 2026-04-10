@@ -100,7 +100,19 @@ def get_call_hierarchy(
     get_callers = getattr(index, "get_callers_by_name", None)
     callers_by_name = get_callers() if get_callers else None
     has_call_data = bool(callers_by_name)
-    if has_call_data:
+    has_lsp_data = bool((getattr(index, "context_metadata", None) or {}).get("lsp_edges"))
+    if has_lsp_data:
+        methodology = "lsp_enriched"
+        confidence = "high"
+        source = "lsp_bridge + ast_call_references"
+        tip = (
+            "LSP-enriched: compiler-grade resolution via language servers (pyright, gopls, "
+            "typescript-language-server, rust-analyzer) for highest confidence, with AST "
+            "call_references and text heuristic as fallback layers. Each edge has a "
+            "'resolution' field: lsp_resolved (compiler-grade), ast_resolved (direct AST), "
+            "ast_inferred (import graph), or text_matched (heuristic)."
+        )
+    elif has_call_data:
         methodology = "ast_call_references"
         confidence = "medium"
         source = "ast_call_references"
@@ -108,7 +120,8 @@ def get_call_hierarchy(
             "AST-based: call references extracted from tree-sitter AST during indexing. "
             "More precise than text heuristic, but still approximate for dynamic dispatch. "
             "Each edge has a 'resolution' field: ast_resolved (direct AST match), "
-            "ast_inferred (resolved via import graph), or text_matched (heuristic)."
+            "ast_inferred (resolved via import graph), or text_matched (heuristic). "
+            "Enable LSP enrichment for compiler-grade resolution."
         )
     else:
         methodology = "text_heuristic"

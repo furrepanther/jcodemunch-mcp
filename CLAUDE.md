@@ -1,9 +1,9 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.27.0 (published to PyPI)
+- **Version:** 1.28.0 (published to PyPI)
 - **INDEX_VERSION:** 8
-- **Tests:** 2490 passed, 8 skipped
+- **Tests:** 2530 passed, 8 skipped
 - **Python:** >=3.10
 
 ## Key Files
@@ -25,6 +25,8 @@ src/jcodemunch_mcp/
     sqlite_store.py    # CodeIndex, save/load/incremental_save, WAL-aware LRU cache (_db_mtime_ns)
   embeddings/
     local_encoder.py   # Bundled ONNX local encoder (all-MiniLM-L6-v2, 384-dim); WordPiece tokenizer, encode_batch(), download_model()
+  enrichment/
+    lsp_bridge.py      # LSP bridge — opt-in compiler-grade call graph resolution via pyright/gopls/ts-language-server/rust-analyzer; LSPServer lifecycle, LSPBridge multi-server manager, enrich_call_graph_with_lsp() entry point
   retrieval/
     signal_fusion.py   # Weighted Reciprocal Rank (WRR) fusion: lexical + structural + similarity + identity channels
   summarizer/

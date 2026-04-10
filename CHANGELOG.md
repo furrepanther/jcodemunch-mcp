@@ -2,6 +2,15 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.28.0] — 2026-04-10
+
+### Added
+- **LSP Bridge enrichment layer** (Gap 2B): new `enrichment/lsp_bridge.py` module — optional, opt-in integration with language servers for compiler-grade call graph resolution. Manages LSP server lifecycles for pyright (Python), typescript-language-server (TS/JS), gopls (Go), and rust-analyzer (Rust). Strictly additive: if a language server isn't installed, falls back to pure tree-sitter + heuristic with zero behaviour change
+- **`lsp_resolved` resolution tier**: new highest-confidence tier in call graph edges. `get_call_hierarchy` now reports four tiers: `lsp_resolved` (compiler-grade via LSP), `ast_resolved` (direct tree-sitter match), `ast_inferred` (resolved via import graph), `text_matched` (heuristic). When LSP data is present, `_meta.methodology` is `lsp_enriched` and `confidence_level` is `high`
+- **LSP enrichment in `index_folder`**: when `enrichment.lsp_enabled` is set to `true` in config.jsonc, the indexing pipeline calls LSP servers to resolve unqualified call sites after tree-sitter parsing. Resolved edges are stored in `context_metadata.lsp_edges` and consumed by the call graph at query time
+- **`enrichment` config block**: new configuration section in config.jsonc — `enrichment.lsp_enabled` (default `false`), `enrichment.lsp_servers` (per-language server map), `enrichment.lsp_timeout_seconds` (default 30). Supports both global and per-project config
+- 40 new tests in `tests/test_lsp_bridge.py` covering JSON-RPC helpers, server lifecycle, graceful degradation, call graph integration, config helpers, and index_folder integration
+
 ## [1.27.0] — 2026-04-10
 
 ### Added

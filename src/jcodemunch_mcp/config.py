@@ -312,6 +312,8 @@ DEFAULTS = {
     "session_max_queries": 50,
     # Agent Selector
     "agent_selector": {},
+    # LSP enrichment
+    "enrichment": {},
 }
 
 CONFIG_TYPES = {
@@ -377,6 +379,7 @@ CONFIG_TYPES = {
     "session_max_age_minutes": int,
     "session_max_queries": int,
     "agent_selector": dict,
+    "enrichment": dict,
 }
 
 
