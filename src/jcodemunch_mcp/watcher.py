@@ -588,7 +588,7 @@ class WatcherManager:
                 # Slow path: wait for the ongoing reindex, then return its result
                 while folder in self._pending:
                     await self._condition.wait()
-                return self._pending_results.get(
+                return self._pending_results.pop(
                     folder, {"status": "concurrent_complete", "folder": folder}
                 )
 
@@ -644,6 +644,7 @@ class WatcherManager:
                                 storage_path=self._storage_path,
                                 extra_ignore_patterns=self._extra_ignore_patterns,
                                 follow_symlinks=self._follow_symlinks,
+                                on_reindex=self._on_reindex,
                                 quiet=self._quiet,
                                 log_file_handle=self._log_file_handle,
                             ),
