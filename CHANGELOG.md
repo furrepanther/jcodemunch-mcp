@@ -2,6 +2,20 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.35.0] — 2026-04-12
+
+### Added
+- **`plan_refactoring` tool** ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236)): generate edit-ready `{old_text, new_text}` refactoring plans in a single call. Supports rename, move, extract, and signature change operations across all affected files. Handles import rewrites for 20+ languages, collision detection, inter-symbol dependency warnings, path alias detection, non-code file scanning, and multi-line signature capture. 325 new tests
+
+### Fixed
+- Python 3.10 compatibility in `plan_refactoring` — removed Python 3.12+ f-string syntax ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- False call sites no longer reported for multi-line signature continuation lines ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- `_plan_extract` no longer unconditionally adds source import when no staying symbol references extracted symbols ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- `_split_python_import` preserves indentation for imports inside `try:` blocks ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+
+### Changed
+- Extracted `_capture_multiline_sig()` helper and hoisted `_file_to_module()` to module level — net -142 lines of duplication ([#237](https://github.com/jgravelle/jcodemunch-mcp/pull/237))
+
 ## [1.34.0] — 2026-04-11
 
 ### Added
