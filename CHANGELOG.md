@@ -2,6 +2,14 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.40.0] — 2026-04-13
+
+### Added
+- **Voice-to-Codebase (`gcm --voice`)** — speak a question about your codebase, hear the answer spoken back. Full audio pipeline: Groq Whisper STT → jCodeMunch retrieval → Groq LLM → Orpheus TTS playback. Push-to-talk via Enter key, with text fallback. Install with `pip install jcodemunch-mcp[groq-voice]`. Supports multi-turn voice conversation, configurable model, and verbose timing.
+- **Auto Repo Explainer (`gcm explain`)** — generate a narrated explainer video for any codebase in a single command. Pipeline: gather repo structure + key symbols → Groq LLM generates narration script → Orpheus TTS renders audio → Pillow renders 1920x1080 dark-theme slides → FFmpeg composites into MP4. Install with `pip install jcodemunch-mcp[groq-explain]` (requires FFmpeg on PATH). Produces 45-90 second videos with file tree and code snippet slides.
+- New optional dependency groups: `[groq-voice]` (sounddevice, numpy), `[groq-explain]` (Pillow)
+- 18 new tests for voice and explainer modules (`test_groq_voice.py`, `test_groq_explainer.py`)
+
 ## [1.39.1] — 2026-04-13
 
 ### Fixed

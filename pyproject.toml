@@ -1,6 +1,6 @@
 [project]
 name = "jcodemunch-mcp"
-version = "1.39.1"
+version = "1.40.0"
 description = "Token-efficient MCP server for source code exploration via tree-sitter AST parsing"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,9 @@ watch = ["watchfiles>=1.0.0"]
 semantic = ["sentence-transformers>=2.2.0"]
 local-embed = ["onnxruntime>=1.16.0"]
 groq = ["openai>=1.0.0"]
-all = ["anthropic>=0.40.0", "google-generativeai>=0.8.0", "openai>=1.0.0", "pyyaml>=6.0", "uvicorn>=0.20.0", "starlette>=0.27.0", "anyio>=4.0.0", "watchfiles>=1.0.0", "sentence-transformers>=2.2.0", "onnxruntime>=1.16.0"]
+groq-voice = ["openai>=1.0.0", "sounddevice>=0.4.6", "numpy>=1.24.0"]
+groq-explain = ["openai>=1.0.0", "Pillow>=10.0.0"]
+all = ["anthropic>=0.40.0", "google-generativeai>=0.8.0", "openai>=1.0.0", "pyyaml>=6.0", "uvicorn>=0.20.0", "starlette>=0.27.0", "anyio>=4.0.0", "watchfiles>=1.0.0", "sentence-transformers>=2.2.0", "onnxruntime>=1.16.0", "sounddevice>=0.4.6", "numpy>=1.24.0", "Pillow>=10.0.0"]
 
 
 [project.scripts]

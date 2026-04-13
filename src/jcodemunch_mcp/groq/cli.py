@@ -4,6 +4,8 @@ Usage:
     gcm "how does authentication work?" --repo pallets/flask
     gcm "where are the API routes?"                          # current directory
     gcm --chat --repo facebook/react                         # interactive mode
+    gcm --voice --repo pallets/flask                         # voice conversation
+    gcm explain --repo pallets/flask -o explainer.mp4        # narrated explainer video
 """
 
 import argparse
@@ -20,15 +22,18 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="gcm",
         description="Ask any question about any codebase. Powered by jCodeMunch + Groq.",
     )
-    p.add_argument("question", nargs="?", help="Question to ask about the codebase")
+    p.add_argument("question", nargs="?", help="Question to ask (or 'explain' subcommand)")
     p.add_argument("--repo", "-r", help="GitHub repo (owner/name) or local path (default: current directory)")
     p.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Groq model (default: {DEFAULT_MODEL})")
     p.add_argument("--fast", action="store_const", const=FAST_MODEL, dest="model", help=f"Use fast model ({FAST_MODEL})")
     p.add_argument("--budget", "-b", type=int, default=8000, help="Token budget for context retrieval (default: 8000)")
     p.add_argument("--chat", "-c", action="store_true", help="Interactive multi-turn chat mode")
+    p.add_argument("--voice", action="store_true", help="Voice conversation mode (speak questions, hear answers)")
     p.add_argument("--no-stream", action="store_true", help="Disable streaming output")
     p.add_argument("--verbose", "-v", action="store_true", help="Show timing and retrieval details")
     p.add_argument("--version", action="store_true", help="Show version and exit")
+    # explain-specific flags (ignored unless question == "explain")
+    p.add_argument("--output", "-o", default="explainer.mp4", help="Output path for explain command (default: explainer.mp4)")
     return p
 
 
@@ -131,12 +136,27 @@ def _run_chat(cfg: GcmConfig, repo_id: str, stream: bool, verbose: bool) -> None
         print()  # blank line between turns
 
 
+def _run_explain(cfg: GcmConfig, repo_id: str, output: str, verbose: bool) -> None:
+    """Generate a narrated explainer video."""
+    from .explainer import generate_explainer
+
+    generate_explainer(cfg, repo_id, output_path=output, verbose=verbose)
+
+
+def _run_voice(cfg: GcmConfig, repo_id: str, verbose: bool) -> None:
+    """Run voice conversation mode."""
+    from .voice import run_voice_loop
+
+    run_voice_loop(cfg, repo_id, verbose=verbose)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     """CLI entrypoint for gcm."""
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.version:
+    # Handle --version (only on main parser)
+    if getattr(args, "version", False):
         try:
             from importlib.metadata import version as pkg_version
             v = pkg_version("jcodemunch-mcp")
@@ -146,11 +166,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     # Build config
-    cfg = GcmConfig(model=args.model, token_budget=args.budget)
+    model = getattr(args, "model", DEFAULT_MODEL) or DEFAULT_MODEL
+    budget = getattr(args, "budget", 8000) or 8000
+    cfg = GcmConfig(model=model, token_budget=budget)
     err = cfg.validate()
     if err:
         print(f"Error: {err}", file=sys.stderr)
         sys.exit(1)
+
+    verbose = getattr(args, "verbose", False)
 
     # Resolve repo
     repo = args.repo or "."
@@ -160,24 +184,32 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Ensure indexed
     from .retriever import ensure_indexed
 
-    if args.verbose:
+    if verbose:
         print(f"[repo] {repo}", file=sys.stderr)
 
-    repo_id, idx_err = ensure_indexed(repo, cfg.storage_path, cfg.github_token, verbose=args.verbose)
+    repo_id, idx_err = ensure_indexed(repo, cfg.storage_path, cfg.github_token, verbose=verbose)
     if idx_err:
         print(f"Error: {idx_err}", file=sys.stderr)
         sys.exit(1)
 
-    if args.verbose:
+    if verbose:
         print(f"[indexed] {repo_id}", file=sys.stderr)
 
-    # Route to chat or single-question mode
-    stream = not args.no_stream
+    # Route to the right mode
+    if getattr(args, "question", None) == "explain":
+        _run_explain(cfg, repo_id, args.output, verbose)
+        return
 
-    if args.chat:
-        _run_chat(cfg, repo_id, stream, args.verbose)
-    elif args.question:
-        _run_single(cfg, repo_id, args.question, stream, args.verbose)
+    if getattr(args, "voice", False):
+        _run_voice(cfg, repo_id, verbose)
+        return
+
+    stream = not getattr(args, "no_stream", False)
+
+    if getattr(args, "chat", False):
+        _run_chat(cfg, repo_id, stream, verbose)
+    elif getattr(args, "question", None):
+        _run_single(cfg, repo_id, args.question, stream, verbose)
     else:
         parser.print_help()
         sys.exit(1)
