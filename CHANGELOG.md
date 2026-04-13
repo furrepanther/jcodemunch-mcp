@@ -2,6 +2,13 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.36.0] — 2026-04-12
+
+### Added
+- **Arduino language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.ino`/`.pde` files parsed via tree-sitter-arduino grammar (C++ superset). Classes, structs, enums, functions, constants extracted. Import extraction reuses `#include` path
+- **VHDL language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.vhd`/`.vhdl`/`.vho`/`.vhs` files parsed via regex. Extracts entity, architecture, package, process, function, procedure, component, signal, constant, type/subtype. Import extraction for `library`/`use` clauses (`work` library excluded)
+- **Verilog/SystemVerilog language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.v`/`.vh`/`.sv`/`.svh` files parsed via regex. Extracts module, interface, class, function, task, package, typedef, parameter/localparam, `` `define ``. Import extraction for `` `include `` directives
+
 ## [1.35.1] — 2026-04-12
 
 ### Fixed
