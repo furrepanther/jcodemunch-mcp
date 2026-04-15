@@ -299,6 +299,9 @@ _CONCENTRATED_REPO = {
 class TestDiversityPacking:
     def test_diversity_spreads_across_files(self, tmp_path):
         """With diversity enabled, results should come from multiple files."""
+        from jcodemunch_mcp.tools.get_ranked_context import _HAS_JCORE
+        if not _HAS_JCORE:
+            pytest.skip("diversity packing requires native backend")
         repo, storage = _make_repo(tmp_path, _CONCENTRATED_REPO)
         result = get_ranked_context(
             repo, query="get", token_budget=4000, storage_path=storage,
@@ -320,7 +323,9 @@ class TestDiversityPacking:
 
     def test_file_group_cap_respected(self, tmp_path):
         """No more than _FILE_GROUP_CAP symbols from a single file."""
-        from jcodemunch_mcp.tools.get_ranked_context import _FILE_GROUP_CAP
+        from jcodemunch_mcp.tools.get_ranked_context import _HAS_JCORE, _FILE_GROUP_CAP
+        if not _HAS_JCORE:
+            pytest.skip("file group cap requires native backend")
         repo, storage = _make_repo(tmp_path, _CONCENTRATED_REPO)
         result = get_ranked_context(
             repo, query="get", token_budget=8000, storage_path=storage,
