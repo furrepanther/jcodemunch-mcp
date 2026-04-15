@@ -1,9 +1,9 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.46.0 (published to PyPI)
+- **Version:** 1.48.0 (published to PyPI)
 - **INDEX_VERSION:** 8
-- **Tests:** 3040 passed, 9 skipped
+- **Tests:** 3164 passed, 9 skipped
 - **Python:** >=3.10
 
 ## Key Files
@@ -60,6 +60,7 @@ src/jcodemunch_mcp/
     get_hotspots.py           # get_hotspots: top-N high-risk symbols by complexity x churn
     get_tectonic_map.py       # get_tectonic_map: logical module topology via 3-signal fusion (structural+behavioral+temporal) + label propagation
     get_signal_chains.py      # get_signal_chains: entry-point-to-leaf pathway discovery; traces how HTTP/CLI/task/event signals propagate through the call graph; discovery + lookup modes
+    render_diagram.py         # render_diagram: universal Mermaid renderer; auto-detects source tool, picks optimal diagram type (flowchart/sequence), encodes metadata as visual signals; 3 themes, smart pruning
     get_repo_health.py        # get_repo_health: one-call triage snapshot (delegate aggregator)
     get_untested_symbols.py   # get_untested_symbols: find functions with no test-file reachability (import graph + name matching)
     audit_agent_config.py    # audit_agent_config: token waste audit for CLAUDE.md, .cursorrules, etc.; cross-refs against index

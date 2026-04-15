@@ -2,6 +2,11 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.48.0] — 2026-04-15
+
+### Added
+- **Universal Mermaid Renderer** — new `render_diagram` tool transforms any graph-producing tool's output into rich, annotated Mermaid markup. Auto-detects the source tool from the dict's key signature and picks the optimal diagram type: `flowchart TD` for call hierarchies and blast radius, `flowchart BT` for impact previews, `flowchart LR` for tectonic plates / dependency graphs / cycles, and `sequenceDiagram` for signal chains. Encodes metadata as visual signals: edge colors for resolution confidence (green=LSP, blue=AST, orange=inferred, red=heuristic), node shapes by symbol kind, subgraph grouping by file/plate/depth, risk heat coloring, drifter/nexus callouts. Three themes: `flow` (blue/purple depth gradient), `risk` (red/yellow/green heat), `minimal` (monochrome). Smart pruning preserves topology under `max_nodes` budget (leaf removal → low-degree removal). Returns `mermaid` markup, `legend`, `node_count`, `edge_count`, `pruned_count`. Supports all 7 graph tools: `get_call_hierarchy`, `get_signal_chains`, `get_tectonic_map`, `get_dependency_cycles`, `get_impact_preview`, `get_blast_radius`, `get_dependency_graph`.
+
 ## [1.47.0] — 2026-04-15
 
 ### Added

@@ -62,6 +62,7 @@ _CANONICAL_TOOL_NAMES: tuple[str, ...] = (
     # Architecture
     "get_dependency_cycles", "get_coupling_metrics", "get_layer_violations",
     "get_extraction_candidates", "get_cross_repo_map", "get_tectonic_map", "get_signal_chains",
+    "render_diagram",
     # Quality & Metrics
     "get_symbol_complexity", "get_churn_rate", "get_hotspots",
     "get_repo_health", "get_symbol_importance", "find_dead_code",
@@ -108,6 +109,7 @@ _TOOL_TIER_STANDARD: frozenset[str] = _TOOL_TIER_CORE | frozenset({
     # Architecture
     "get_dependency_cycles", "get_coupling_metrics", "get_layer_violations",
     "get_cross_repo_map", "get_tectonic_map", "get_signal_chains",
+    "render_diagram",
     # Utilities
     "invalidate_cache",
 })
@@ -1924,6 +1926,43 @@ def _build_tools_list() -> list[Tool]:
                 "required": ["repo"],
             },
         ),
+        Tool(
+            name="render_diagram",
+            description=(
+                "Render any graph-producing tool's output as rich, annotated Mermaid markup. "
+                "Pass the raw output dict from get_call_hierarchy, get_signal_chains, "
+                "get_tectonic_map, get_dependency_cycles, get_impact_preview, "
+                "get_blast_radius, or get_dependency_graph. Auto-detects the source tool "
+                "and picks the optimal diagram type: flowchart TD (call hierarchy, blast radius), "
+                "flowchart BT (impact preview), flowchart LR (tectonic plates, dependency graph, "
+                "cycles), or sequenceDiagram (signal chains). Encodes metadata as visual signals: "
+                "edge colors for resolution confidence, node shapes for symbol kind, subgraph "
+                "grouping by file/plate/depth, risk heat coloring. Themes: 'flow' (blue/purple "
+                "depth gradient), 'risk' (red/yellow/green heat), 'minimal' (monochrome). "
+                "Smart pruning keeps output under max_nodes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "object",
+                        "description": "Raw output dict from any supported graph-producing tool.",
+                    },
+                    "theme": {
+                        "type": "string",
+                        "enum": ["flow", "risk", "minimal"],
+                        "description": "Visual theme: 'flow' (architecture), 'risk' (impact), 'minimal' (docs). Default: flow.",
+                        "default": "flow",
+                    },
+                    "max_nodes": {
+                        "type": "integer",
+                        "description": "Maximum nodes before smart pruning (default 80, range 10–200).",
+                        "default": 80,
+                    },
+                },
+                "required": ["source"],
+            },
+        ),
     ]
     # --- Profile filtering ---------------------------------------------------
     profile = config_module.get("tool_profile", "full")
@@ -2920,6 +2959,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     storage_path=storage_path,
                 )
             )
+        elif name == "render_diagram":
+            from .tools.render_diagram import render_diagram
+            result = await asyncio.to_thread(
+                functools.partial(
+                    render_diagram,
+                    source=arguments["source"],
+                    theme=arguments.get("theme", "flow"),
+                    max_nodes=arguments.get("max_nodes", 80),
+                )
+            )
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -3542,7 +3591,7 @@ def _generate_claude_md_snippet(missing_only: bool = False) -> str:
         ("Architecture", ["get_dependency_cycles", "get_coupling_metrics",
                           "get_layer_violations", "get_extraction_candidates",
                           "get_cross_repo_map", "get_tectonic_map",
-                          "get_signal_chains"]),
+                          "get_signal_chains", "render_diagram"]),
         ("Quality & Metrics", ["get_symbol_complexity", "get_churn_rate", "get_hotspots",
                                 "get_repo_health", "get_symbol_importance",
                                 "find_dead_code", "get_dead_code_v2",
