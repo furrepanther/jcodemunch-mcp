@@ -68,6 +68,8 @@ class _State:
         self._loaded = False
         self._total: int = 0          # cumulative total (disk + in-flight)
         self._unflushed: int = 0      # delta not yet written to disk
+        self._encoding_total: int = 0    # cumulative MUNCH encoding savings
+        self._encoding_unflushed: int = 0
         self._call_count: int = 0     # calls since last savings flush
         self._stats_call_count: int = 0  # calls since last session_stats.json write
         self._anon_id: Optional[str] = None
@@ -95,6 +97,7 @@ class _State:
             logger.debug("Failed to load savings data from %s", path, exc_info=True)
             data = {}
         self._total = data.get("total_tokens_saved", 0)
+        self._encoding_total = data.get("total_encoding_tokens_saved", 0)
         self._anon_id = data.get("anon_id")
         self._loaded = True
 
@@ -249,6 +252,11 @@ class _State:
         else:
             data["anon_id"] = self._anon_id
         data["total_tokens_saved"] = data.get("total_tokens_saved", 0) + self._unflushed
+        if self._encoding_unflushed:
+            data["total_encoding_tokens_saved"] = (
+                data.get("total_encoding_tokens_saved", 0) + self._encoding_unflushed
+            )
+            self._encoding_unflushed = 0
         try:
             path.write_text(json.dumps(data))
         except Exception:
@@ -349,6 +357,30 @@ threading.Thread(
 def _share_savings(delta: int, anon_id: str) -> None:
     """Enqueue a fire-and-forget POST to the community meter. Never raises."""
     _telemetry_queue.put((delta, anon_id))
+
+
+def record_encoding_savings(
+    tokens_saved: int,
+    base_path: Optional[str] = None,
+    tool_name: Optional[str] = None,
+) -> int:
+    """Add tokens saved by MUNCH compact encoding. Tracked independently
+    from retrieval-side savings. Returns new cumulative encoding total."""
+    with _state._lock:
+        _state._ensure_loaded(base_path)
+        delta = max(0, tokens_saved)
+        _state._encoding_total += delta
+        _state._encoding_unflushed += delta
+        _state._call_count += 1
+        if _state._call_count >= _FLUSH_INTERVAL:
+            _state._flush_locked()
+        return _state._encoding_total
+
+
+def get_total_encoding_saved(base_path: Optional[str] = None) -> int:
+    with _state._lock:
+        _state._ensure_loaded(base_path)
+        return _state._encoding_total
 
 
 def record_savings(tokens_saved: int, base_path: Optional[str] = None, tool_name: Optional[str] = None) -> int:

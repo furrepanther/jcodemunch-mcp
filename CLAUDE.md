@@ -1,7 +1,7 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.53.0 (published to PyPI)
+- **Version:** 1.54.0 (published to PyPI)
 - **INDEX_VERSION:** 9
 - **Tests:** 3256 passed, 9 skipped
 - **Python:** >=3.10
@@ -29,6 +29,13 @@ src/jcodemunch_mcp/
     extractor.py       # parse_file() dispatch; custom parsers for Erlang, Fortran, SQL, Razor
     imports.py         # Regex import extraction (19 languages); extract_imports(), resolve_specifier(), build_psr4_map()
     fqn.py             # PHP FQN ↔ symbol_id translation (PSR-4); symbol_to_fqn(), fqn_to_symbol()
+  encoding/
+    __init__.py          # Dispatcher: encode_response(tool, response, format) — auto/compact/json
+    format.py            # MUNCH on-wire primitives: header, legends (@N), scalars, CSV tables
+    gate.py              # 15% savings threshold (JCODEMUNCH_ENCODING_THRESHOLD override)
+    generic.py           # Shape-sniffer fallback encoder (covers all tools w/o custom encoder)
+    decoder.py           # Public decode() — rehydrates MUNCH payloads back to dicts
+    schemas/             # Per-tool custom encoders (tier-1, phase 2+); auto-discovered registry
   storage/
     sqlite_store.py    # CodeIndex, save/load/incremental_save, WAL-aware LRU cache (_db_mtime_ns); get_source_root()
   embeddings/

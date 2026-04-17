@@ -2489,6 +2489,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     logger.info("tool_call: %s args=%s", name, {k: v for k, v in arguments.items() if k != "content"})
 
     try:   # main handler try starts here, before coerce
+        # Extract cross-cutting args that are not part of any tool's schema.
+        # `format` controls compact-output encoding (see .encoding package).
+        _requested_format = None
+        if isinstance(arguments, dict) and "format" in arguments:
+            _requested_format = arguments.pop("format")
         # Coerce stringified booleans/integers/numbers before routing
         schema = (await _ensure_tool_schemas()).get(name)
         if schema:
@@ -3431,6 +3436,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         meta["secrets_redacted"] = _redact_count
             except Exception:
                 logger.debug("Secret redaction failed", exc_info=True)
+
+        # Compact output encoding (MUNCH). Opt-in via `format` argument or
+        # JCODEMUNCH_DEFAULT_FORMAT env; "auto" falls back to JSON unless
+        # savings clear the gate threshold.
+        try:
+            from .encoding import encode_response
+            from .storage.token_tracker import record_encoding_savings
+            encoded, enc_meta = encode_response(name, result, _requested_format)
+            if enc_meta.get("encoding") != "json":
+                saved = enc_meta.get("encoding_tokens_saved", 0)
+                total_enc = record_encoding_savings(saved, base_path=storage_path, tool_name=name)
+                if isinstance(result, dict):
+                    m = result.setdefault("_meta", {})
+                    m["encoding"] = enc_meta["encoding"]
+                    m["encoding_tokens_saved"] = saved
+                    m["total_encoding_tokens_saved"] = total_enc
+                return [TextContent(type="text", text=encoded)]
+        except Exception:
+            logger.debug("Compact encoding failed; emitting JSON", exc_info=True)
 
         return [TextContent(type="text", text=json.dumps(result, separators=(',', ':')))]
 

@@ -2,6 +2,11 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.54.0] — 2026-04-17
+
+### Added
+- **Compact response encoding (MUNCH, phase 1)** — opt-in second-axis token savings independent from retrieval-side optimization. Every tool response can now be emitted in a purpose-built compact format (path/symbol interning, tabular row packing, quoted-CSV data sections) instead of verbose JSON. New `format` argument on every tool accepts `"auto"` (default; falls back to JSON if savings <15%), `"compact"` (force), or `"json"` (never encode). Server-wide default overridable via `JCODEMUNCH_DEFAULT_FORMAT`. Phase 1 ships a schema-agnostic generic encoder that covers all 80+ tools; hand-tuned per-tool encoders land in subsequent releases. `_meta` now surfaces `encoding`, `encoding_tokens_saved`, and a new persisted `total_encoding_tokens_saved` counter so encoding savings are reported separately from retrieval savings. Decoder shipped at `jcodemunch_mcp.encoding.decoder.decode()` for clients that need to rehydrate payloads back to dicts.
+
 ## [1.53.0] — 2026-04-17
 
 ### Added
