@@ -9,18 +9,16 @@ from unittest.mock import patch
 import pytest
 
 
-# Override with the MMD_VIEWER_PATH env var for CI or other dev machines.
-# Falls back to the maintainer's local debug build so the test still runs
-# here without setup. Anyone else sets MMD_VIEWER_PATH or the test skips.
-_DEFAULT_VIEWER_PATH = r"D:\1.Development\mmd-viewer\target\debug\mmd-viewer.exe"
-VIEWER_PATH = os.environ.get("MMD_VIEWER_PATH", _DEFAULT_VIEWER_PATH)
+VIEWER_PATH = os.environ.get("MMD_VIEWER_PATH", "")
 
 
 def _skip_if_no_viewer():
+    if not VIEWER_PATH:
+        pytest.skip("set MMD_VIEWER_PATH to enable render_diagram integration test")
     if not Path(VIEWER_PATH).exists():
         pytest.skip(
             f"mmd-viewer.exe not found at {VIEWER_PATH} "
-            f"(set MMD_VIEWER_PATH to point at your local build)"
+            f"(update MMD_VIEWER_PATH to point at your local build)"
         )
 
 
