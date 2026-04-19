@@ -1,0 +1,214 @@
+"""Tests for the install-pack CLI subcommand."""
+
+import io
+import json
+import zipfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from jcodemunch_mcp.cli.install_pack import (
+    _install_pack,
+    _list_packs,
+    _mask_license,
+    run_install_pack,
+)
+
+
+# ── _mask_license ─────────────────────────────────────────────────────────
+
+def test_mask_license_long():
+    assert _mask_license("ABCD-1234-EFGH-5678") == "ABCD****5678"
+
+
+def test_mask_license_short():
+    assert _mask_license("ABCD") == "ABCD****"
+
+
+def test_mask_license_exact_8():
+    assert _mask_license("12345678") == "1234****"
+
+
+# ── _list_packs ───────────────────────────────────────────────────────────
+
+def _mock_catalog_response(packs):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"packs": packs}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_list_packs_empty(mock_httpx):
+    mock_httpx.get.return_value = _mock_catalog_response([])
+    assert _list_packs() == 0
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_list_packs_shows_entries(mock_httpx, capsys):
+    mock_httpx.get.return_value = _mock_catalog_response([
+        {"id": "fastapi", "name": "FastAPI Starter", "symbols": 5000, "free": True},
+        {"id": "express", "name": "Express Starter", "symbols": 3000, "free": False},
+    ])
+    assert _list_packs() == 0
+    out = capsys.readouterr().out
+    assert "fastapi" in out
+    assert "express" in out
+    assert "FREE" in out
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_list_packs_network_error(mock_httpx):
+    import httpx as real_httpx
+    mock_httpx.HTTPError = real_httpx.HTTPError
+    mock_httpx.get.side_effect = real_httpx.ConnectError("offline")
+    assert _list_packs() == 1
+
+
+# ── _install_pack ─────────────────────────────────────────────────────────
+
+def _make_pack_zip(files: dict[str, bytes], pack_id: str = "testpack") -> bytes:
+    """Create an in-memory zip with pack_id/ prefix and given files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(f"{pack_id}/{name}", content)
+    return buf.getvalue()
+
+
+def _mock_zip_response(zip_bytes: bytes, pack_version: str = "1.0.0"):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {
+        "content-type": "application/zip",
+        "X-Pack-Version": pack_version,
+    }
+    resp.content = zip_bytes
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _mock_error_response(error_msg: str, extra: dict | None = None):
+    body = {"error": error_msg}
+    if extra:
+        body.update(extra)
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "application/json"}
+    resp.json.return_value = body
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_happy_path(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    manifest = {"name": "Test Pack", "total_symbols": 42, "repos": ["org/repo"]}
+    zip_bytes = _make_pack_zip({
+        "manifest.json": json.dumps(manifest).encode(),
+        "local/test-abc123.db": b"fake-index-data",
+    })
+    mock_httpx.get.return_value = _mock_zip_response(zip_bytes)
+
+    result = _install_pack("testpack", base_path=tmp_path)
+    assert result == 0
+
+    # Index file extracted
+    assert (tmp_path / "local" / "test-abc123.db").exists()
+    assert (tmp_path / "local" / "test-abc123.db").read_bytes() == b"fake-index-data"
+
+    # Marker written
+    marker = tmp_path / ".pack-testpack.json"
+    assert marker.exists()
+    marker_data = json.loads(marker.read_text())
+    assert marker_data["name"] == "Test Pack"
+    assert marker_data["installed_version"] == "1.0.0"
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_already_installed(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    marker = tmp_path / ".pack-testpack.json"
+    marker.write_text("{}")
+
+    result = _install_pack("testpack", base_path=tmp_path)
+    assert result == 0
+    # No HTTP call made
+    mock_httpx.get.assert_not_called()
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_force_reinstall(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    marker = tmp_path / ".pack-testpack.json"
+    marker.write_text("{}")
+
+    zip_bytes = _make_pack_zip({"local/x.db": b"data"})
+    mock_httpx.get.return_value = _mock_zip_response(zip_bytes)
+
+    result = _install_pack("testpack", force=True, base_path=tmp_path)
+    assert result == 0
+    mock_httpx.get.assert_called_once()
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_json_error(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    mock_httpx.get.return_value = _mock_error_response(
+        "License required for premium pack",
+        {"get_license": "https://example.com/pricing"},
+    )
+    result = _install_pack("premium-pack", base_path=tmp_path)
+    assert result == 1
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_network_error(mock_httpx, tmp_path, monkeypatch):
+    import httpx as real_httpx
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    mock_httpx.HTTPError = real_httpx.HTTPError
+    mock_httpx.get.side_effect = real_httpx.ConnectError("offline")
+    result = _install_pack("testpack", base_path=tmp_path)
+    assert result == 1
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_path_traversal_rejected(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("testpack/../../../etc/passwd", b"pwned")
+    mock_httpx.get.return_value = _mock_zip_response(buf.getvalue())
+
+    result = _install_pack("testpack", base_path=tmp_path)
+    assert result == 1
+
+
+@patch("jcodemunch_mcp.cli.install_pack.httpx")
+def test_install_pack_bad_zip(mock_httpx, tmp_path, monkeypatch):
+    monkeypatch.setenv("JCODEMUNCH_SHARE_SAVINGS", "0")
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "application/zip", "X-Pack-Version": "1.0.0"}
+    resp.content = b"this is not a zip file"
+    resp.raise_for_status = MagicMock()
+    mock_httpx.get.return_value = resp
+
+    result = _install_pack("testpack", base_path=tmp_path)
+    assert result == 1
+
+
+# ── run_install_pack ──────────────────────────────────────────────────────
+
+@patch("jcodemunch_mcp.cli.install_pack._list_packs", return_value=0)
+def test_run_install_pack_list_flag(mock_list):
+    assert run_install_pack(list_packs=True) == 0
+    mock_list.assert_called_once()
+
+
+@patch("jcodemunch_mcp.cli.install_pack._list_packs", return_value=0)
+def test_run_install_pack_no_pack_id(mock_list):
+    assert run_install_pack(pack_id=None) == 0
+    mock_list.assert_called_once()

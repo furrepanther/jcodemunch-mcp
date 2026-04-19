@@ -1,5 +1,43 @@
 # Token Savings: jCodeMunch MCP
 
+jCodeMunch saves tokens on two independent axes:
+
+1. **Retrieval** — agents fetch exact symbols instead of reading whole files.
+2. **Encoding (MUNCH)** — responses that do go to the agent are packed in a
+   purpose-built compact wire format, not verbose JSON.
+
+The retrieval axis is the big number (typically 95%+ on code-reading tasks);
+encoding is a smaller-but-independent multiplier on whatever traffic remains.
+They compose — every byte saved on the wire is a byte the agent doesn't pay
+to read.
+
+## MUNCH encoding benchmark (v1.56.0)
+
+Representative payloads through the dispatcher with `format="compact"`.
+Measured as `(json_bytes - compact_bytes) / json_bytes` with `json.dumps`
+using the default separators.
+
+| Tool                   | Encoder | JSON bytes | Compact bytes | Savings |
+|------------------------|---------|------------|---------------|---------|
+| `find_references`      | `fr1`   | 2,265      | 1,242         | **45.2%** |
+| `get_dependency_graph` | `dg1`   | 1,702      | 998           | **41.4%** |
+| `get_call_hierarchy`   | `ch1`   | 4,133      | 2,238         | **45.9%** |
+| `search_symbols`       | `ss1`   | 4,545      | 2,754         | **39.4%** |
+| `get_repo_outline`     | `ro1`   | 4,642      | 2,277         | **50.9%** |
+| `get_hotspots`         | `gen1`  | 1,987      | 887           | **55.4%** |
+
+**Median 45.5% / mean 46.4% / min 39.4% / max 55.4%.**
+
+Run it yourself:
+
+```bash
+cd munch-bench && python -m munch_bench.encoding_bench
+```
+
+Encoding is opt-in per call (`format="auto"` falls back to JSON when savings
+drop below 15%) and does not affect retrieval-side savings. See
+[SPEC_MUNCH.md](SPEC_MUNCH.md) for the wire format.
+
 ## Third-Party Validation
 
 Independent A/B test by [@Mharbulous](https://github.com/Mharbulous) — 50 iterations, Claude Sonnet 4.6, real Vue 3 + Firebase production codebase. JCodeMunch vs native tools (Grep/Glob/Read) on a naming-audit task.

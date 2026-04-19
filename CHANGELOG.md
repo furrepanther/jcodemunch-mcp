@@ -2,7 +2,490 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
-## [Unreleased]
+## [1.60.1] — 2026-04-18
+
+### Changed
+- **`adaptive_tiering: true` + HTTP transport now refuses to start (#248).** Previously emitted a startup WARNING. Process-global tier state leaks across concurrent HTTP clients — one client's `plan_turn(model=...)` flip silently changes the tool surface for every other concurrent client on the same server. That's a misconfiguration, not a heads-up condition. The server now logs an ERROR and aborts via `HttpAdaptiveTieringError` (a `SystemExit` subclass) on both `sse` and `streamable-http` transports. Stdio is unaffected. Existing installs running `adaptive_tiering: false` (the default) see zero change. A per-session tier-state fix that would make HTTP + adaptive_tiering actually safe remains tracked for a future release.
+
+### Fixed
+- **`model_tier_map` substring match now picks the longest-matching key (#249).** Previously depended on dict iteration order — a config with both `"claude": "standard"` and `"claude-haiku": "core"` could resolve `claude-haiku-4-5` to either tier depending on config write order. Longest-match-wins makes specific entries beat broader ones regardless of order. Three regression tests cover both insertion orders and the broader-key-still-matches-non-haiku case.
+
+## [1.60.0] — 2026-04-18
+
+### Added
+- **Tiered tool surface with runtime model-driven switching (#246, @MariusAdrian88)** — jcodemunch's 60+ tools now narrow per model at runtime, so request-capped plans stretch further when a small model is driving. Three tiers (`core` / `standard` / `full`); tier bundle contents are user-editable in `config.jsonc` (moved from hardcoded constants in `server.py`) with baked-in defaults as a fallback. New `model_tier_map` config maps model identifiers to tiers via layered matching: normalize (lowercase, strip provider prefix, strip bracket/date suffixes) → exact → glob → substring → `*` wildcard → `full` fallback. Opt-in `adaptive_tiering: true` enables runtime switching; defaults preserve prior behavior. New tools: `set_tool_tier(tier=...)` for explicit override, `announce_model(model=...)` for non-plan_turn flows; `plan_turn(model=...)` piggybacks tier flips on the opening-move call (zero extra MCP requests). Both tier-control tools are force-included at list-time and call-time so users can never strand themselves via `disabled_tools`. Bundle ∩ `disabled_tools` conflicts emit startup WARNING + `config --check` diagnostic. HTTP transport + `adaptive_tiering: true` emits startup WARNING about process-global tier state leaking across clients (hard refusal tracked in #248).
+- **Server error responses include `summary` field** — unexpected exceptions now add a short, sanitized `RuntimeError: ...` summary alongside the generic top-level `error`. Full traceback still lands in the server log.
+
+### Fixed
+- **MUNCH `search_text` round-trip restored (#246)** — the on-wire schema declared flat columns `file|line|line_content`, but the real tool response is nested `{results:[{file, matches:[...]}]}`. Two matches in the same file collapsed to one null row; the matched line `text` was read as `line_content` (wrong column); `before`/`after` context arrays were dropped entirely. Rewritten with flatten/regroup around the real nested shape; columns now `file|line|text|before|after` with context lines riding as JSON strings inside CSV cells (adversarial-tested for embedded commas, quotes, newlines). Encoding ID bumped `st1` → `st2`; legacy `st1` payloads still decode via a new `LEGACY_ENCODING_IDS` discovery hook in the encoder registry. `schema_driven.decode()` gains an opt-in `scalar_types` parameter so typed scalars (ints, floats, bools) round-trip correctly instead of stringifying — `search_text` declares its numeric/boolean fields; every other schema's behavior is unchanged.
+- **`tools/list_changed` notifications actually emit now (#246)** — `_emit_tools_list_changed` was a `pass` placeholder, so the entire runtime-tier feature was silently never notifying clients. New `_get_mcp_session` helper does concrete `srv.request_context.session` lookup with narrowed `LookupError` / `AttributeError` handling; warns at WARNING level when the session lacks `send_tool_list_changed` so SDK version mismatches are visible. Integration test exercises the real `FakeServer.request_context.session` chain instead of mocking the helper.
+- **`plan_turn` tie-safe heap (#246)** — the bounded heap stored `(score, entry)` tuples, so equal scores forced Python to compare `dict` values and raised `TypeError: '<' not supported between instances of 'dict' and 'dict'`. Heap now stores `(score, symbol_id, entry)` triples; regression test covers the equal-score case with two indexed `helper()` symbols.
+- **`plan_turn` tier flip atomicity (#246)** — when `adaptive_tiering: true`, the tier switch now runs after the handler returns successfully. A handler failure can no longer leave a half-applied session tier.
+- **`render_diagram` integration test portability (#250)** — test now skips cleanly when `MMD_VIEWER_PATH` is unset, instead of falling back to a hardcoded path only one contributor's machine had. Set `MMD_VIEWER_PATH` to opt in locally.
+
+### Migration
+- No config changes required. Existing installs see zero behavior change; `adaptive_tiering` defaults to `false`.
+- Operators wanting runtime tier switching: set `adaptive_tiering: true` in `config.jsonc` and optionally customize `tool_tier_bundles` and `model_tier_map`. Run `jcodemunch-mcp config --upgrade` to pull the new keys into an existing config file without clobbering user values.
+- The MUNCH `search_text` encoder bumped from `st1` to `st2`. Existing cached `st1` payloads continue to decode via `LEGACY_ENCODING_IDS`.
+
+## [1.59.1] — 2026-04-18
+
+### Fixed
+- **Redaction no longer mangles source code (F1)** — the `bearer_token` pattern was over-broad: `(?i)(?:bearer|token)\s+...` matched ordinary identifiers like `def refresh_token session_identifier_name`. Pattern is now header-anchored (`Authorization:` context or capital `Bearer `). The `generic_api_key` pattern now requires the captured value to include all three character classes (upper+lower+digit) AND meet a Shannon entropy threshold (≥3.5 bits/char), so SCREAMING_CASE and snake_case identifiers pass through unchanged.
+- **Redaction depth cap no longer leaks secrets (F2)** — past the 20-level recursion guard, `redact_dict` previously returned the raw subtree. Deeply nested payloads now collapse to `[REDACTED:depth_exceeded]` instead.
+- **`_meta` string fields now scanned for secrets (F6)** — the blanket `_meta` bypass in `redact_dict` skipped strings inside `_meta.hint` / `_meta.error`, letting secrets echoed into metadata leak unredacted. Only scalar numeric/bool fields bypass scanning now; strings and nested containers are redacted.
+- **`mermaid_viewer.open_diagram` contains filesystem errors (F4)** — `mkdir` and `write_text` failures previously propagated as exceptions, contradicting the docstring's "non-fatal on failure" contract. They now return `{opened: False, error: "write_failed: ..."}`.
+- **Per-call temp-file purge (F3)** — `open_diagram` now prunes `jcm-*.mmd` files older than one hour on every invocation, preventing unbounded growth under repeated use.
+
+### Security
+- **Viewer executable gate (F5)** — `resolve_viewer_path` now checks that the configured path looks executable (exec suffix on Windows; execute bit on POSIX). Stale config pointing at a non-executable file now returns `None` instead of attempting to spawn it.
+
+## [1.59.0] — 2026-04-17
+
+### Added
+- **`render_diagram` optional `open_in_viewer` parameter (#245, @MariusAdrian88)** — opt-in integration with the companion [mmd-viewer](https://github.com/MariusAdrian88/mmd-viewer) binary for instant visual preview of rendered Mermaid diagrams. Fully gated behind two new config keys: `render_diagram_viewer_enabled` (default `false`) controls whether the `open_in_viewer` parameter is exposed in the tool schema at all, so LLM clients see no change unless the feature is enabled locally; `mermaid_viewer_path` points at the executable (empty = `$PATH` lookup). When enabled and invoked, the rendered Mermaid is written to a `jcm-`-prefixed `.mmd` file under `<index_storage>/temp/mermaid/` and piped to the viewer on stdin. Non-fatal by design: viewer-missing or spawn-failure adds a `viewer_error` field to the response but always returns the Mermaid markup. Cleanup is selective — only `jcm-`-prefixed files are removed, on both startup (stale files from prior sessions) and shutdown (only if the viewer was invoked this session). Windows file-lock aware with 500 ms retry on unlink.
+
+## [1.58.0] — 2026-04-17
+
+### Added
+- **MUNCH TypeScript decoder + agent hints (phase 5)** — reference TS decoder at `clients/ts/decoder.ts` (zero dependencies, ~200 lines) decodes both tier-1 and generic-fallback MUNCH payloads to plain JS objects; falls through to `JSON.parse` for non-MUNCH input. New `AGENT_HINTS.md` ships a drop-in prompt snippet so agents can read MUNCH payloads directly without a client-side decoder, plus a worked example walking through legend handles, scalar quoting, and table rehydration. Closes phase 5 of the MUNCH rollout — clients that cannot or will not decode MUNCH can still request `format="json"` to opt out per call or set `JCODEMUNCH_DEFAULT_FORMAT=json` to disable globally.
+
+## [1.57.0] — 2026-04-17
+
+### Added
+- **MUNCH spec + benchmark harness (phase 4)** — full on-wire format spec shipped as [SPEC_MUNCH.md](SPEC_MUNCH.md) so third-party clients and alternate MCP servers can decode MUNCH payloads without depending on the Python reference decoder. New A/B encoding benchmark at `munch-bench/munch_bench/encoding_bench.py` (`python -m munch_bench.encoding_bench`) runs representative fixtures through the dispatcher and reports JSON bytes, compact bytes, savings %, and token-saved estimate. Current numbers: **median 45.5% / max 55.4%** across six tools covering both tier-1 and generic-fallback paths — exceeds the PRD's ≥30% median / ≥50% graph-tool targets.
+- **README compact-output section** and updated `TOKEN_SAVINGS.md` with the dual-axis framing (retrieval + encoding compose independently).
+
+## [1.56.0] — 2026-04-17
+
+### Changed
+- **MUNCH generic fallback hardened (phase 3)** — the shape-sniffer that covers every tool without a hand-tuned encoder now produces fully round-trippable output. Original table keys, column order, and per-column types (int / float / bool / str) are preserved via an embedded schema line instead of being emitted under synthesized `table_<tag>` keys. Top-level scalars now round-trip with their original types via a compact companion `__stypes` map. Nested `dict` values containing list-of-dicts children are flattened with a dotted key so downstream tools can still read them. Path-prefix legend promotion widened and byte-threshold tightened so interning only fires when it actually saves bytes. Table-tag alphabet widened from 7 to 26 and the tag-vs-scalar classifier rewritten against the `<char>,` CSV leading-byte signal so scalar keys can freely start with any letter. Malformed or pathological shapes (mixed arrays, oversized table counts, short lists) fall through to JSON-blob passthrough instead of crashing; the savings gate still discards compact output whenever it isn't a net win, so the fallback remains safe to fail-open across all 65+ tools without custom encoders.
+
+## [1.55.0] — 2026-04-17
+
+### Added
+- **MUNCH tier-1 custom encoders (phase 2)** — 15 hand-tuned per-tool compact encoders now ship, replacing the generic fallback for the highest-payoff tools: `get_dependency_graph` (dg1), `get_call_hierarchy` (ch1), `find_references` (fr1), `find_importers` (fi1), `get_blast_radius` (br1), `get_impact_preview` (ip1), `get_signal_chains` (sc1), `get_dependency_cycles` (dc1), `get_tectonic_map` (tm1), `search_symbols` (ss1), `search_text` (st1), `search_ast` (sa1), `get_file_outline` (fo1), `get_repo_outline` (ro1), `get_ranked_context` (rc1). Each encoder declares a schema with column order, type hints, and intern columns; dispatcher picks the custom encoder when available and falls back to the generic shape-sniffer otherwise. Round-trip tested — decoded payload preserves all table contents and scalar fields. Sample `get_dependency_graph` response (8 edges, 6 files) drops from 721 bytes JSON to 490 bytes compact (32% savings); larger responses climb toward 50-70% as legend interning amortizes.
+- **Schema-driven encoder helper** (`encoding/schema_driven.py`) lets future per-tool encoders be written in ~30 lines of declarative config: `TableSpec` + scalar/nested-dict/meta/json-blob declarations, then two one-line `encode`/`decode` wrappers.
+
+## [1.54.0] — 2026-04-17
+
+### Added
+- **Compact response encoding (MUNCH, phase 1)** — opt-in second-axis token savings independent from retrieval-side optimization. Every tool response can now be emitted in a purpose-built compact format (path/symbol interning, tabular row packing, quoted-CSV data sections) instead of verbose JSON. New `format` argument on every tool accepts `"auto"` (default; falls back to JSON if savings <15%), `"compact"` (force), or `"json"` (never encode). Server-wide default overridable via `JCODEMUNCH_DEFAULT_FORMAT`. Phase 1 ships a schema-agnostic generic encoder that covers all 80+ tools; hand-tuned per-tool encoders land in subsequent releases. `_meta` now surfaces `encoding`, `encoding_tokens_saved`, and a new persisted `total_encoding_tokens_saved` counter so encoding savings are reported separately from retrieval savings. Decoder shipped at `jcodemunch_mcp.encoding.decoder.decode()` for clients that need to rehydrate payloads back to dicts.
+
+## [1.53.0] — 2026-04-17
+
+### Added
+- **Constraint-chain retrieval** — new `winnow_symbols` tool runs a multi-axis query against the index in a single round trip. Accepts an ordered list of `{axis, op, value}` criteria (AND semantics) that intersect signals no existing tool composes: `kind`, `language`, `name` (regex), `file` (glob), `complexity`, `decorator`, `calls` (direct call references), `summary/docstring` text, and git `churn` (with configurable `window_days`). Survivors are ranked by PageRank-based `importance` (default), `complexity`, `churn`, or `name`. Replaces the common 4–5-call pattern of intersecting `search_symbols` + `get_hotspots` + `get_untested_symbols` + `find_references` client-side — e.g. "complex functions that call `db.Exec` and churned recently" resolves in one call. Reports `matched`, `total_scanned`, and `supported_axes` alongside ranked results.
+
+## [1.52.1] — 2026-04-16
+
+### Changed
+- **`plan_refactoring` full language coverage** — import and definition patterns, import rewrite logic, and import formatting extended to ~40 previously-uncovered languages (erlang, solidity, zig, clojure, powershell, ocaml, fsharp, nim, tcl, dlang, pascal, ada, cobol, matlab, apex, css/scss/sass/less/styl, razor, blade, al, nix, ejs, verse, asm, vue, and others). Refactorings in these languages now emit correct edits instead of falling through to a generic default. New `TestLanguageCoverage` suite enforces parity between `LANGUAGE_REGISTRY` and the refactoring patterns so future language additions can't silently drift.
+- **Config tool registry** — `config.py` `all_tools` list updated to include 25+ tools added since last refresh (`audit_agent_config`, `check_rename_safe`, `get_call_hierarchy`, `get_churn_rate`, `get_hotspots`, `get_impact_preview`, `get_pr_risk_profile`, `get_symbol_provenance`, `plan_refactoring`, `render_diagram`, `search_ast`, and more); alphabetically sorted.
+- **Test parametrization** — 4 test files consolidated from 330 individual functions to 78 parametrized ones (322 pytest cases, all assertions preserved). Net −1,508 lines of boilerplate across `test_plan_refactoring.py`, `test_config.py`, `test_find_importers.py`, `test_hardening.py`, and `test_render_diagram.py`.
+
+### Fixed
+- **Test index contamination** — `test_project_intel.py` was orphaning 22 indexes in `~/.code-index/` on each run; now isolated to `tmp_path`.
+
+Thanks to **@MariusAdrian88** for this contribution (#244).
+
+## [1.52.0] — 2026-04-16
+
+### Added
+- **AST Pattern Matching** — new `search_ast` tool provides cross-language structural code pattern matching across all 70+ indexed languages. Write one query, match everywhere — no need to know language-specific tree-sitter node types. Two modes: **(1) Preset anti-patterns** — 10 curated detectors that auto-translate across languages: `empty_catch` (silently swallowed errors), `bare_except` (catch-all without specific type), `deeply_nested` (5+ control-flow levels), `nested_loops` (O(n³)+ triple loops), `god_function` (100+ line functions), `eval_exec` (dynamic code execution — injection risk), `hardcoded_secret` (credential patterns in string literals), `todo_fixme` (unfinished work markers), `magic_number` (unexplained numeric constants), `reassigned_param` (overwritten function parameters). **(2) Custom mini-DSL** — ad-hoc structural queries: `call:*.unwrap` (call-site glob matching), `string:/password/i` (regex over string literals), `comment:/TODO/i` (regex over comments), `nesting:5+` / `loops:3+` / `lines:80+` (threshold queries). Run by category (`security`, `error_handling`, `complexity`, `performance`, `maintenance`) or `category=all` for a full sweep. Every match is attributed to its enclosing indexed symbol with complexity metadata. Universal node-type mapping covers 15 language families (Python, JS/TS, Go, Rust, Java, C#, Ruby, PHP, C/C++, Kotlin, Swift, Dart). Results sorted by severity (error → warning → info).
+- Updated **assess** and **triage** MCP prompt templates to recommend `search_ast` for security and anti-pattern sweeps.
+
+## [1.51.0] — 2026-04-16
+
+### Added
+- **Symbol Provenance** — new `get_symbol_provenance` tool traces the complete authorship lineage and evolution narrative of any symbol through git history. Uses `git log -L` line-range tracking (with file-level fallback) to find every commit that touched a symbol, classifies each into semantic categories (creation, bugfix, refactor, feature, perf, rename, revert, etc.), extracts motivating intent from commit bodies, and generates a human-readable narrative summarising who created it, why, and how it evolved. Returns ranked author list, evolution summary with lifespan/frequency metrics, and dominant change pattern. Use before refactoring unfamiliar code to understand the "why" behind it.
+- **PR Risk Profile** — new `get_pr_risk_profile` tool produces a unified risk assessment for all changes between two git refs. Fuses five orthogonal signals — blast radius (30%), complexity (25%), test gaps (20%), churn (15%), and change volume (10%) — into a single composite `risk_score` (0.0–1.0) with `risk_level` (low/medium/high/critical). Returns per-signal breakdowns, top-5 riskiest changed symbols, untested symbol list, and actionable recommendations. Designed for CI gating and the `/review` workflow. One call replaces manual orchestration of `get_changed_symbols` + `get_blast_radius` + `get_hotspots` + `get_untested_symbols`.
+- **Response Secret Redaction** — all tool responses are now scanned for leaked credentials before reaching the LLM context window. Detects AWS access keys (AKIA...), AWS secret keys, GCP service account emails, Azure storage/client keys, JWT tokens, GitHub PATs (ghp_/gho_/...), Slack tokens, PEM private key headers, generic API keys (32+ char high-entropy values), and private IPv4 addresses (10.x, 172.16-31.x, 192.168.x). Matched values are replaced with `[REDACTED:<type>]` placeholders. Controlled by `redact_response_secrets` config key (default: true) or `JCODEMUNCH_REDACT_RESPONSE_SECRETS` env var. The `_meta` field reports `secrets_redacted` count when any redactions occur.
+- Updated the **assess** MCP prompt template to recommend `get_pr_risk_profile` as the quick-path and `get_symbol_provenance` for deep-path analysis.
+
+## [1.50.1] — 2026-04-16
+
+### Fixed
+- **Devcontainer/Docker support** — `index_folder` no longer rejects shallow paths like `/workspace` or `/app` when running inside a container. Auto-detects Docker (`/.dockerenv`), Podman (`/run/.containerenv`), VS Code devcontainers (`REMOTE_CONTAINERS`), GitHub Codespaces (`CODESPACES`), and generic container orchestrators (`container` env var). Minimum path depth is relaxed from 3 to 2 components; bare `/` is still rejected. `trusted_folders` remains available as a manual override. Fixes #243.
+
+## [1.50.0] — 2026-04-15
+
+### Added
+- **Branch-Aware Delta Indexing** — jcodemunch-mcp now maintains per-branch delta layers instead of re-indexing from scratch when you switch git branches. One base index (typically `main`/`master`) stores the full index; non-base branches save only what changed relative to the base (O(delta) storage). At query time, the delta is composed onto the base to produce the branch-specific view. All 55+ tools auto-detect the current branch via `git rev-parse --abbrev-ref HEAD` — no new parameters required. Supports detached HEAD (uses commit SHA), non-git folders (graceful no-op), and stale delta detection (warns when base was re-indexed after the delta was created). New storage: `branch_deltas` and `branch_meta` tables in the existing SQLite DB. `list_repos` now shows indexed branches. INDEX_VERSION bumped to 9 (auto-migration from v8).
+
+## [1.49.0] — 2026-04-15
+
+### Added
+- **Project Intelligence** — new `get_project_intel` tool auto-discovers and structurally parses non-code knowledge files (Dockerfiles, docker-compose, GitHub Actions, GitLab CI, CircleCI, K8s manifests, .env templates, Makefiles, package.json scripts, pyproject.toml scripts) and cross-references them to indexed code symbols. Returns structured intelligence grouped into 6 categories: `infra` (Docker stages/services/ports, K8s resources, Terraform from index), `ci` (pipeline jobs/triggers/run commands), `config` (env vars with defaults and comments), `deps` (scripts/targets/entry points), `api` (OpenAPI endpoints, GraphQL types, Protobuf services from index), `data` (dbt/SQLMesh models, column counts, migration files from index). Cross-references link Dockerfile entrypoints to source files, compose build contexts to directories, env var names to code that reads them, CI run commands to test files, and script targets to referenced paths. Every YAML parser has a regex fallback — works with zero optional dependencies. Single `os.walk` pass with 200-file cap, 256KB size guard, and 50-item output caps per category.
+
+## [1.48.0] — 2026-04-15
+
+### Added
+- **Universal Mermaid Renderer** — new `render_diagram` tool transforms any graph-producing tool's output into rich, annotated Mermaid markup. Auto-detects the source tool from the dict's key signature and picks the optimal diagram type: `flowchart TD` for call hierarchies and blast radius, `flowchart BT` for impact previews, `flowchart LR` for tectonic plates / dependency graphs / cycles, and `sequenceDiagram` for signal chains. Encodes metadata as visual signals: edge colors for resolution confidence (green=LSP, blue=AST, orange=inferred, red=heuristic), node shapes by symbol kind, subgraph grouping by file/plate/depth, risk heat coloring, drifter/nexus callouts. Three themes: `flow` (blue/purple depth gradient), `risk` (red/yellow/green heat), `minimal` (monochrome). Smart pruning preserves topology under `max_nodes` budget (leaf removal → low-degree removal). Returns `mermaid` markup, `legend`, `node_count`, `edge_count`, `pruned_count`. Supports all 7 graph tools: `get_call_hierarchy`, `get_signal_chains`, `get_tectonic_map`, `get_dependency_cycles`, `get_impact_preview`, `get_blast_radius`, `get_dependency_graph`.
+
+## [1.47.0] — 2026-04-15
+
+### Added
+- **Signal Chain Discovery** — new `get_signal_chains` tool traces how external signals (HTTP requests, CLI commands, scheduled tasks, events) propagate through the codebase via the call graph. Each chain starts at a **gateway** (route handler, CLI command, task decorator, event listener, main entry point) and follows BFS callees to leaf symbols. Two modes: **discovery** (omit `symbol` — maps all chains, reports orphan symbols not on any chain) and **lookup** (pass a `symbol` — returns which user-facing chains it participates in, e.g. "validate_email sits on POST /api/users and cli:import-users"). Detects gateways from Flask/FastAPI/Spring/NestJS/ASP.NET route decorators, @click/@app.command CLI, @celery/@dramatiq task queues, event handlers, and standard entry points. Filter by `kind` (http/cli/event/task/main/test). Reuses existing AST-resolved call graph infrastructure for 70+ language support.
+
+## [1.46.0] — 2026-04-15
+
+### Added
+- **Tectonic Analysis** — new `get_tectonic_map` tool discovers the logical module topology of a codebase by fusing three independent coupling signals: structural (import edges), behavioral (shared symbol references), and temporal (git co-churn). Returns auto-detected file clusters ("plates"), each with an anchor file, cohesion score, inter-plate coupling map, drifter detection (files whose directory doesn't match their logical module), and nexus alerts (god-module risk). Plate count emerges from the topology — no k parameter. Pure Python label propagation, no external dependencies.
+
+## [1.45.1] — 2026-04-15
+
+### Documentation
+- **Hermes Agent integration** — added "Works with" section to README with Hermes Agent config example; submitted optional skill PR to [NousResearch/hermes-agent#10413](https://github.com/NousResearch/hermes-agent/pull/10413)
+
+## [1.45.0] — 2026-04-15
+
+### Added
+- **Enhanced BM25 tokenizer** — Porter-style suffix stemming ("searching" → "search", "running" → "run") and bidirectional abbreviation expansion (40 entries: "db" ↔ "database", "config" ↔ "configuration", etc.). Significantly improves recall for natural-language queries against code symbols.
+- **Diversity-aware budget packing** — `get_ranked_context` now spreads results across files (per-file cap of 3, decay penalty for same-file repeats) instead of greedy same-file stacking. Produces more useful context bundles.
+
+### Fixed
+- **Content hash consistency** — drift detection always uses SHA-256, preventing false-positive staleness on existing indexes.
+
+## [1.44.1] — 2026-04-14
+
+### Fixed
+- `claude-md` (and Cursor/Windsurf rule generators) now respects `tool_profile` and `disabled_tools` — only emits tools the model can actually call (#242).
+
+## [1.44.0] — 2026-04-14
+
+### Added
+- **Tool profiles** — new `tool_profile` config key with three tiers to control context budget (#242):
+  - `"core"` — 16 essential tools (indexing, search, retrieval, relationships). ~5-6k tokens saved vs full.
+  - `"standard"` — core + analytics, architecture, quality, impact tools (~40 tools).
+  - `"full"` — all tools (default, backwards-compatible).
+- **Compact schemas** — new `compact_schemas` config key strips rarely-used advanced parameters (debug, fusion, semantic_*, fuzzy_*, etc.) from tool schemas. The server still accepts them — they're just hidden from the LLM. Saves ~1-2k tokens on top of any profile.
+- `config` command now shows `tool_profile` and `compact_schemas` in the Tool Profile section.
+- 6 new tests for profile filtering and compact schema stripping.
+
+## [1.43.0] — 2026-04-13
+
+### Added
+- **6 new languages** — F# (`.fs`, `.fsi`, `.fsx`), Clojure (`.clj`, `.cljs`, `.cljc`, `.edn`), Emacs Lisp (`.el`), Nim (`.nim`, `.nims`, `.nimble`), Tcl (`.tcl`, `.tk`, `.itcl`), D (`.d`, `.di`)
+- Custom tree-sitter parsers for all 6 languages with full symbol extraction: F# modules/functions/types/values, Clojure namespace-qualified defn/def/defprotocol/defrecord, Emacs Lisp defun/defvar/defconst/defmacro with docstrings, Nim proc/func/template/macro/type/var/let/const, Tcl proc with namespace nesting (`::`-qualified names), D functions/classes/structs/interfaces/enums/templates with nested method extraction
+
+### Documentation
+- Updated `server.json` version (1.8.6 → 1.43.0) and language count (25+ → 70+)
+- Updated `benchmarks/whitepaper.md` language counts from "25+" to "70+"
+- Added CONFIGURATION.md and GROQ.md to README.md documentation table
+- Updated `LANGUAGE_SUPPORT.md` valid language names list with all 73 registered languages
+
+## [1.42.0] — 2026-04-13
+
+### Added
+- **11 new languages** — Pascal/Delphi (`.pas`, `.dpr`, `.dpk`, `.lpr`, `.pp`), MATLAB (`.mat`, `.mlx`, + `.m` path-heuristic disambiguation vs Objective-C), Ada (`.adb`, `.ads`), COBOL (`.cob`, `.cbl`, `.cpy`), Common Lisp (`.lisp`, `.cl`, `.lsp`, `.asd`), Solidity (`.sol`), Zig (`.zig`, `.zon`), PowerShell (`.ps1`, `.psm1`, `.psd1`), Apex/Salesforce (`.cls`, `.trigger`), OCaml (`.ml`, `.mli`), PL/SQL (`.pls`, `.plb`, `.pck`, `.pkb`, `.pks` → existing SQL parser)
+- Custom tree-sitter parsers for all 10 new grammar-backed languages with full symbol extraction: functions, classes, types, constants, methods, and language-specific constructs (COBOL paragraphs/sections, Solidity contracts/events/modifiers, Zig test declarations, Apex triggers, OCaml modules)
+- MATLAB vs Objective-C `.m` file disambiguation via path heuristics (directories named `matlab/`, `toolbox/`, `simulink/` → MATLAB; `ios/`, `xcode/`, `cocoa/` → Objective-C)
+
+## [1.41.0] — 2026-04-13
+
+### Added
+- **munch-bench** — Retrieval + Inference benchmark consolidated into the mothership (Phase 5 of Groq Integration). 110 questions across 11 repos, evaluation harness with Groq/OpenAI/Anthropic providers, static HTML leaderboard with Chart.js. Install with `pip install jcodemunch-mcp[bench]`, run with `munch-bench run --provider groq`. First results: Sonnet 0.81, Haiku 0.68, Groq Llama 0.69 judge scores.
+- New optional dependency group `[bench]` (openai, anthropic, pyyaml, rich, jinja2)
+- `munch-bench` CLI entrypoint: `run`, `compare`, `corpus-stats` subcommands
+
+## [1.40.1] — 2026-04-13
+
+### Fixed
+- Fix `jcodemunch-mcp index <owner/repo>` CLI crash — was passing `repo=` instead of `url=` to `index_repo()`, causing `TypeError: got an unexpected keyword argument 'repo'`
+
+## [1.40.0] — 2026-04-13
+
+### Added
+- **Voice-to-Codebase (`gcm --voice`)** — speak a question about your codebase, hear the answer spoken back. Full audio pipeline: Groq Whisper STT → jCodeMunch retrieval → Groq LLM → Orpheus TTS playback. Push-to-talk via Enter key, with text fallback. Install with `pip install jcodemunch-mcp[groq-voice]`. Supports multi-turn voice conversation, configurable model, and verbose timing.
+- **Auto Repo Explainer (`gcm explain`)** — generate a narrated explainer video for any codebase in a single command. Pipeline: gather repo structure + key symbols → Groq LLM generates narration script → Orpheus TTS renders audio → Pillow renders 1920x1080 dark-theme slides → FFmpeg composites into MP4. Install with `pip install jcodemunch-mcp[groq-explain]` (requires FFmpeg on PATH). Produces 45-90 second videos with file tree and code snippet slides.
+- New optional dependency groups: `[groq-voice]` (sounddevice, numpy), `[groq-explain]` (Pillow)
+- 18 new tests for voice and explainer modules (`test_groq_voice.py`, `test_groq_explainer.py`)
+
+## [1.39.1] — 2026-04-13
+
+### Fixed
+- **gcm: fix GitHub repo detection on Linux** — `_is_github_repo` now correctly identifies `owner/name` patterns on all platforms (was failing on Linux where `/` is `os.path.sep`)
+
+## [1.39.0] — 2026-04-13
+
+### Added
+- **Codebase Q&A CLI (`gcm`)** — ask any question about any codebase, get an answer in under 3 seconds. Powered by jCodeMunch retrieval + Groq inference. Install with `pip install jcodemunch-mcp[groq]`. Supports GitHub repos (`--repo owner/name`), local directories, streaming output, interactive `--chat` mode, `--fast` flag for 8B model, and configurable token budget. Auto-indexes on first use.
+
+## [1.38.0] — 2026-04-13
+
+### Added
+- **speedreview GitHub Action** (`speedreview/`) — AI code review in under 5 seconds. Composite action uses jCodeMunch locally for symbol-level diff analysis (`get_changed_symbols` + `get_blast_radius` + `get_ranked_context`) and Groq for sub-2s inference. Posts structured review as PR comment. Usage: `uses: jgravelle/jcodemunch-mcp/speedreview@main`.
+
+## [1.37.0] — 2026-04-13
+
+### Added
+- **Groq Remote MCP integration** — full tutorial (`GROQ.md`), Docker deployment (`Dockerfile`, `docker-compose.yml`, `Caddyfile`), validation script (`examples/groq_validate.py`), and README section. Deploy jCodeMunch as an HTTPS SSE endpoint and connect via Groq's Responses API in a single API call. Includes allowed-tools presets (explore, deep, review, full) and model recommendations.
+
+## [1.36.0] — 2026-04-12
+
+### Added
+- **Arduino language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.ino`/`.pde` files parsed via tree-sitter-arduino grammar (C++ superset). Classes, structs, enums, functions, constants extracted. Import extraction reuses `#include` path
+- **VHDL language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.vhd`/`.vhdl`/`.vho`/`.vhs` files parsed via regex. Extracts entity, architecture, package, process, function, procedure, component, signal, constant, type/subtype. Import extraction for `library`/`use` clauses (`work` library excluded)
+- **Verilog/SystemVerilog language support** ([#239](https://github.com/jgravelle/jcodemunch-mcp/pull/239)): `.v`/`.vh`/`.sv`/`.svh` files parsed via regex. Extracts module, interface, class, function, task, package, typedef, parameter/localparam, `` `define ``. Import extraction for `` `include `` directives
+
+## [1.35.1] — 2026-04-12
+
+### Fixed
+- **invalidate_cache + index_folder reliability** ([#238](https://github.com/jgravelle/jcodemunch-mcp/pull/238)): `invalidate_cache` followed by `index_folder` (incremental) no longer returns "No changes detected". Fixes Windows WAL file-locking race, legacy JSON resurrection, and adds `_force_full_reindex` coordination flag
+- **meta_fields config applied to batch results** ([#238](https://github.com/jgravelle/jcodemunch-mcp/pull/238)): `meta_fields` filter now strips/filters nested `_meta` in batch tool responses (e.g. `get_file_outline` with `file_paths=[...]`)
+- **WatcherManager self-restarts on crash** ([#238](https://github.com/jgravelle/jcodemunch-mcp/pull/238)): monitoring loop auto-restarts with 100ms backoff, up to 5 consecutive attempts before clean exit
+- **Orphan index cleanup on startup** ([#238](https://github.com/jgravelle/jcodemunch-mcp/pull/238)): indexes whose `source_root` no longer exists on disk are deleted at server startup
+
+## [1.35.0] — 2026-04-12
+
+### Added
+- **`plan_refactoring` tool** ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236)): generate edit-ready `{old_text, new_text}` refactoring plans in a single call. Supports rename, move, extract, and signature change operations across all affected files. Handles import rewrites for 20+ languages, collision detection, inter-symbol dependency warnings, path alias detection, non-code file scanning, and multi-line signature capture. 325 new tests
+
+### Fixed
+- Python 3.10 compatibility in `plan_refactoring` — removed Python 3.12+ f-string syntax ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- False call sites no longer reported for multi-line signature continuation lines ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- `_plan_extract` no longer unconditionally adds source import when no staying symbol references extracted symbols ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+- `_split_python_import` preserves indentation for imports inside `try:` blocks ([#236](https://github.com/jgravelle/jcodemunch-mcp/pull/236))
+
+### Changed
+- Extracted `_capture_multiline_sig()` helper and hoisted `_file_to_module()` to module level — net -142 lines of duplication ([#237](https://github.com/jgravelle/jcodemunch-mcp/pull/237))
+
+## [1.34.0] — 2026-04-11
+
+### Added
+- **MCP progress notifications** ([#232](https://github.com/jgravelle/jcodemunch-mcp/issues/232)): `index_folder`, `index_repo`, `index_file`, and `embed_repo` now emit `notifications/progress` when the client provides a `progressToken`. Zero token cost — notifications go to the host (e.g. VS Code MCP widget), never the model. Shows label, ASCII bar, percent, count, and current item name
+- **`ProgressReporter`** (`progress.py`): thread-safe, monotonic progress helper. No pulse threads, no fake drift — progress reflects real completed work
+- **`make_progress_notify()`** (`progress.py`): bridge function that creates a thread-safe callback from the MCP request context, using `asyncio.run_coroutine_threadsafe` to safely send notifications from worker threads
+- 16 new tests in `tests/test_progress.py` covering reporter lifecycle, monotonicity, thread safety, format, no-op behavior, and tool signature wiring
+
+## [1.33.0] — 2026-04-11
+
+### Added
+- **Auto-watch on demand** ([#233](https://github.com/jgravelle/jcodemunch-mcp/pull/233)): when `watch: true` is set in config (or `JCODEMUNCH_WATCH=1`), the server automatically reindexes and starts watching any unwatched repo before a tool executes. Eliminates silent-stale-data that causes LLMs to abandon jcodemunch tools for the session. Race-safe via `asyncio.Condition` — concurrent tool calls to the same unwatched repo trigger only one reindex
+- **`WatcherManager` class** (`watcher.py`): manages dynamic folder watching with `add_folder()`, `remove_folder()`, `is_watched()` (O(1)), `list_folders()`, `ensure_indexed()` (race-safe), and `run()` (crash recovery). Replaces direct task manipulation in `watch_folders()`
+- **`get_source_root()`** (`sqlite_store.py`): lightweight metadata-only SQLite query to resolve repo ID to folder path without loading full `CodeIndex`
+- **`watch` config key**: opt-in via `watch: true` in config.jsonc or `JCODEMUNCH_WATCH=1` env var (default: `false`)
+- 15 new tests in `tests/test_watcher_dynamic.py` covering manager lifecycle, race guard, and auto-watch integration
+
+### Fixed
+- Restarted watch tasks (crash recovery in `WatcherManager.run()`) now receive the `on_reindex` callback — previously dropped, causing idle-timeout to fire prematurely after a task restart
+- `_pending_results` dict in `WatcherManager.ensure_indexed()` no longer leaks — entries are popped after concurrent waiters consume them
+- Individual `_watch_single` tasks are now explicitly cancelled and awaited during `watch_folders` shutdown (previously only manager/watchdog tasks were cancelled)
+
+## [1.32.1] — 2026-04-10
+
+### Fixed
+- **`embed_repo` preflight performance** (#231): cache-discovery no longer loads and decodes every stored embedding blob just to get symbol IDs. New `EmbeddingStore.get_all_ids()` queries only the `symbol_id` column. Eliminates unnecessary CPU, memory, and latency on repos with existing embeddings
+
+## [1.32.0] — 2026-04-10
+
+### Added
+- **`jcodemunch-mcp index` CLI command** ([#230](https://github.com/jgravelle/jcodemunch-mcp/issues/230)): Index a local folder or GitHub repo directly from the terminal. Defaults to the current directory when no target is given — no `init` required. Supports `--no-ai-summaries`, `--follow-symlinks`, and `--extra-ignore` flags
+
+### Changed
+- **Version renumbered from 2.1.0 → 1.32.0.** The 2.0.0 bump was premature — every change from 1.24.4 through 2.1.0 was purely additive (new tools, new opt-in config, new CLI subcommands). Nothing was removed, renamed, or made incompatible. INDEX_VERSION stayed at 8, all config defaults preserved existing behavior, and LSP/dispatch features are off by default. Per semver, additive features are minor bumps. The full renumbering: 1.24.4→1.25.0, 1.24.5→1.26.0, 1.25.0→1.27.0, 1.26.0→1.28.0, 1.27.0→1.29.0, 1.28.0→1.30.0, 2.0.0→1.31.0, 2.1.0→1.32.0. PyPI releases under the old numbers remain installable but are logically equivalent to their renumbered counterparts
+
+## [1.31.0] — 2026-04-10
+
+### Added
+- **Interface & trait dispatch resolution** (Phase 5 / Gap 2C): resolves interface/trait method calls to their concrete implementations via LSP `textDocument/implementation`. Supports Go interfaces, Rust traits, TypeScript/Java/C#/PHP interfaces and abstract classes. Adds `dispatches_to` edges with `lsp_dispatch` resolution tier
+- **`_detect_interface_keywords()`** in `parser/extractor.py`: tags interface/trait/abstract symbols in `keywords` during tree-sitter parsing — zero-cost, no INDEX_VERSION bump required. Covers Go (`interface_type`), Rust (`trait_item`), TypeScript (`interface_declaration`), Java/C# (interface + abstract class), PHP (interface + trait)
+- **`goto_implementation()` on `LSPServer`**: new method parallel to `goto_definition()`, sends `textDocument/implementation` request. Updated `_initialize()` capabilities to advertise implementation support
+- **`DispatchEdge` dataclass**: represents interface method → concrete implementation mapping with `lsp_dispatch` resolution
+- **`resolve_implementations()` on `LSPBridge`**: resolves interface method positions to concrete implementations across multiple language servers. Caps at 50 implementations per interface method
+- **`enrich_dispatch_edges()` entry point**: high-level function that scans parsed symbols for interface keywords, collects method positions, resolves implementations via LSP, and returns serializable edge dicts
+- **`dispatch_edges` in `context_metadata`**: stored alongside existing `lsp_edges` in both full and incremental `index_folder` paths
+- **`_dispatch_callers()` / `_dispatch_callees()`** in `_call_graph.py`: query dispatch edges to find concrete implementations (callees) or callers through interface dispatch. Integrated at highest priority in `find_direct_callers/callees`
+- **`dispatches` section in `get_call_hierarchy`**: new response field showing interface dispatch relationships grouped by interface/method, with concrete implementation details
+- **`lsp_dispatch_enriched` methodology**: when dispatch edges are present, `_meta.methodology` is `lsp_dispatch_enriched` and `confidence_level` is `high`
+- 31 new tests in `tests/test_dispatch_resolution.py` covering interface keyword detection (15 languages), `goto_implementation` unit tests, `DispatchEdge` dataclass, `_dispatch_callers/_dispatch_callees` with mock indexes, `get_call_hierarchy` dispatches section, graceful degradation, and TS interface keyword propagation through `index_folder`
+
+## [1.30.0] — 2026-04-10
+
+### Added
+- **LSP Bridge enrichment layer** (Gap 2B): new `enrichment/lsp_bridge.py` module — optional, opt-in integration with language servers for compiler-grade call graph resolution. Manages LSP server lifecycles for pyright (Python), typescript-language-server (TS/JS), gopls (Go), and rust-analyzer (Rust). Strictly additive: if a language server isn't installed, falls back to pure tree-sitter + heuristic with zero behaviour change
+- **`lsp_resolved` resolution tier**: new highest-confidence tier in call graph edges. `get_call_hierarchy` now reports four tiers: `lsp_resolved` (compiler-grade via LSP), `ast_resolved` (direct tree-sitter match), `ast_inferred` (resolved via import graph), `text_matched` (heuristic). When LSP data is present, `_meta.methodology` is `lsp_enriched` and `confidence_level` is `high`
+- **LSP enrichment in `index_folder`**: when `enrichment.lsp_enabled` is set to `true` in config.jsonc, the indexing pipeline calls LSP servers to resolve unqualified call sites after tree-sitter parsing. Resolved edges are stored in `context_metadata.lsp_edges` and consumed by the call graph at query time
+- **`enrichment` config block**: new configuration section in config.jsonc — `enrichment.lsp_enabled` (default `false`), `enrichment.lsp_servers` (per-language server map), `enrichment.lsp_timeout_seconds` (default 30). Supports both global and per-project config
+- 40 new tests in `tests/test_lsp_bridge.py` covering JSON-RPC helpers, server lifecycle, graceful degradation, call graph integration, config helpers, and index_folder integration
+
+## [1.29.0] — 2026-04-10
+
+### Added
+- **Bundled ONNX local encoder** (Gap 1): new `embeddings/local_encoder.py` module ships a zero-config embedding provider using `all-MiniLM-L6-v2` (Apache 2.0, 384-dim, ~23 MB). Install via `pip install 'jcodemunch-mcp[local-embed]'` — no API keys, no internet after first download, no configuration. Includes a minimal WordPiece tokenizer (no `transformers` dependency) and L2-normalised mean-pooled output
+- **`local_onnx` provider (priority 0)**: when `onnxruntime` is installed and the model is present, `embed_repo` and `search_symbols(semantic=true)` automatically use the bundled encoder — zero friction. Falls through to sentence-transformers/Gemini/OpenAI if unavailable
+- **`download-model` CLI subcommand**: `jcodemunch-mcp download-model` fetches the ONNX model + vocab from HuggingFace to `~/.code-index/models/all-MiniLM-L6-v2/`. Auto-downloads on first `embed_repo` call if model is missing. Override path via `JCODEMUNCH_LOCAL_EMBED_MODEL` env var or `--target-dir` flag
+- **`[local-embed]` install extra**: `pip install 'jcodemunch-mcp[local-embed]'` adds `onnxruntime>=1.16.0` dependency
+
+## [1.28.0] — 2026-04-10
+
+### Added
+- **Unified signal fusion pipeline** (Gap 3 full): new `retrieval/signal_fusion.py` module implements Weighted Reciprocal Rank (WRR) fusion across four channels — lexical (BM25), structural (PageRank), similarity (embeddings), and identity (exact/prefix/segment match). Configurable per-channel weights via `config.jsonc` under `retrieval.fusion_weights`. Eliminates linear score addition in favour of proper rank fusion
+- **`search_symbols(fusion=true)`**: new parameter activates multi-signal fusion ranking. Debug mode (`debug=true`) reports `fusion_score`, `channel_contributions`, and `channel_ranks` per result. `_meta` includes active channels, weights, and smoothing constant
+- **`get_ranked_context(fusion=true)`**: fusion-based context assembly with per-item channel contribution breakdown in results
+- **Post-task diagnostics hook** (Gap 4B): new `hook-taskcomplete` CLI subcommand — on task completion, runs three diagnostics scoped to session-modified files: `find_dead_code` (newly-orphaned symbols), `get_untested_symbols` (untested new code), `check_references` (unreferenced symbols). Injects a compact housekeeping nudge via `systemMessage`
+- **Subagent briefing hook** (Gap 4C): new `hook-subagent-start` CLI subcommand — injects a condensed repo orientation (file/symbol/language stats, top-15 PageRank central symbols, full 40+ tool catalog) for spawned agents. Ensures subagents start with structural context
+- Both new hooks are auto-registered in `~/.claude/settings.json` by `jcodemunch-mcp init` and `config --check` verifies their presence
+
+## [1.27.0] — 2026-04-10
+
+### Added
+- **PreCompact structural landmarks** (Gap 4A): `run_precompact()` now enriches the session snapshot with PageRank-ranked top-20 central symbols and recently-changed symbols from the session journal. Gives the LLM a structural "table of contents" that survives context compaction
+- **Per-edge resolution tiers** (Gap 2A): every edge in `get_call_hierarchy` callers/callees now carries a `resolution` field — `ast_resolved` (direct tree-sitter match), `ast_inferred` (resolved via import graph), or `text_matched` (heuristic word-boundary fallback). `_meta.resolution_tiers` summarises the tier distribution
+- **Identity channel in search** (Gap 3 partial): `search_symbols` replaces the old `50.0` exact-name hack with a proper identity scoring channel — exact match (50), prefix match (30), qualified-ID segment match (20). Debug mode (`debug=true`) now reports `identity` score and `identity_type` in the per-field breakdown
+
+## [1.26.0] — 2026-04-10
+
+### Added
+- **Guided workflow prompts**: 4 new MCP prompt templates alongside the existing `workflow` prompt — `explore` (onboard to an unfamiliar repo), `assess` (pre-merge impact analysis), `triage` (diagnose code quality), `trace` (investigate a bug through the call graph). Each composes existing jcodemunch tools into a step-by-step workflow. Accessible via the MCP prompt protocol (`list_prompts` / `get_prompt`)
+
+## [1.25.0] — 2026-04-10
+
+### Added
+- **`get_untested_symbols`**: new tool — find functions and methods with no evidence of test-file reachability. Uses import-graph analysis + name matching (AST call_references when available, word-boundary text heuristic as fallback). Classifies symbols as "unreached" (no test imports the source file) or "imported_not_called" (test imports the module but no test references this specific function). Supports `file_pattern` glob filter, `min_confidence` threshold, and `max_results` cap
+- **`get_blast_radius` enrichment**: every confirmed entry now includes a `has_test_reach: bool` field indicating whether any test file imports that file AND references the affected symbol by name
+- **`_is_test_file()` expanded**: now recognizes JS/TS test patterns (`.spec.ts`, `.spec.js`, `.test.ts`, `.test.js`, `__tests__/`) in addition to existing Python patterns. Benefits both `find_dead_code` and `get_untested_symbols`
+
+## [1.24.3] — 2026-04-10
+
+### Added
+- **`watch --once`**: one-shot index sync — indexes all paths incrementally and exits immediately. No watchfiles dependency required. Supports multiple paths. Exit code 1 if any path fails (#227, thanks @kecsap!)
+
+## [1.24.2] — 2026-04-08
+
+### Added
+- **Starter Packs** (`install-pack` subcommand): download pre-built indexes for popular frameworks. `--list` shows the catalog, `--license KEY` for premium packs, `--force` to re-download. Free packs require no license
+- **Per-call pulse signal** (`_pulse.json`): opt-in activity file for downstream dashboards and monitors. Set `JCODEMUNCH_EVENT_LOG=1` to enable. Writes tool name, timestamp, call count, and tokens saved on every tool call (#225)
+
+### Fixed
+- `test_summarizer`: "misconfigured" error now names the missing package and includes the exact `pip install` command instead of a generic message (#224)
+- `config` output: `allow_remote_summarizer` moved from Privacy section to AI Summarizer section with clarification that it only affects custom base URLs, not standard API endpoints (#224)
+
+## [1.24.1] — 2026-04-08
+
+### Changed
+- **Comprehensive doc audit** — reviewed all CHANGELOG entries from 1.21.13–1.24.0 and updated 6 user-facing docs:
+  - **USER_GUIDE.md**: Added 12 missing tools (`plan_turn`, `get_session_context`, `register_edit`, `get_session_snapshot`, `get_call_hierarchy`, `get_hotspots`, `get_coupling_metrics`, `get_dependency_cycles`, `get_extraction_candidates`, `get_impact_preview`, `get_dead_code_v2`), `decorator` filter on `search_symbols`, `include_source`/`source_budget`/`decorator_filter` on `get_blast_radius`, negative evidence, and 9 new workflow patterns
+  - **CONFIGURATION.md**: Added 15 missing config keys (`agent_selector`, `exclude_skip_directories`, `exclude_secret_patterns`, `languages_adaptive`, `session_journal`, `turn_budget_tokens`, `turn_gap_seconds`, `negative_evidence_threshold`, `search_result_cache_max`, `plan_turn_*_threshold`, `session_resume`, `session_max_age_minutes`, `session_max_queries`, `discovery_hint`, `strict_timeout_ms`)
+  - **AGENT_HOOKS.md**: Added Python CLI hooks section (`hook-pretooluse`, `hook-posttooluse`, `hook-precompact`) with `init --hooks` as recommended install method; added call hierarchy, hotspots, decorator search, session tools to both prompt policy blocks
+  - **ARCHITECTURE.md**: Added 16 missing tools to Tool Surface; updated directory structure with `agent_selector.py`, `cli/`, `parser/` details, `_call_graph.py`, `session_journal.py`, `session_state.py`, `turn_budget.py`, `plan_turn.py`
+  - **README.md**: Added call hierarchy, hotspots, coupling metrics, dependency cycles to structural queries section; added session-aware routing, enforcement hooks, agent selector to feature list; updated `init` docs for `--hooks`
+  - **QUICKSTART.md**: Added enforcement hooks to `init` feature list; documented `--demo` flag
+
+## [1.24.0] — 2026-04-08
+
+### Added
+- **Agent Selector**: opt-in complexity-based model routing system that assesses request complexity using pre-processing signals and recommends (manual mode) or automatically selects (auto mode) the appropriate model tier (low/medium/high). Off by default — zero behavioral change for existing users
+  - `ComplexityScorer`: weighted linear scoring using retrieval set size, symbol count, cross-file references, cross-project flag, language complexity, and token estimate
+  - `ModelRouter`: three modes — `off` (default), `manual` (advisory prompts on step-up; `verbosePrompts` for step-down), `auto` (automatic routing with metadata annotation)
+  - Default batting orders for Anthropic, OpenAI, and Google providers; fully customizable via `agentSelector` config block
+  - Session-level init param overrides (`agentSelector.mode`, `agentSelector.activeProvider`, `agentSelector.verbosePrompts`)
+  - Tier resolution edge cases: missing tier fallback, single-model provider passthrough, unknown provider graceful degradation
+  - 39 new tests covering scorer, router, config, tier resolution, and language classification
+
+## [1.23.5] — 2026-04-08
+
+### Changed
+- CI: bump `actions/checkout` v4→v5 and `astral-sh/setup-uv` v3→v6 for Node.js 24 compatibility (GitHub enforces June 2nd 2026)
+
+## [1.23.4] — 2026-04-08
+
+### Fixed
+- Python import resolution: `resolve_specifier` now handles module-style absolute imports (`app.notifications.mentions`) by converting dots to slashes and trying each auto-detected source root (`backend/`, `src/`, etc.) as a prefix. Previously `posixpath.splitext` treated the last dotted component as a file extension, breaking all non-flat Python layouts (#223, @kallevaravas)
+- Python import extraction: `_PY_FROM` and `_PY_IMPORT` regexes now allow optional leading whitespace, capturing function-local and class-body imports that were previously silently dropped (#223, @kallevaravas)
+
+## [1.23.3] — 2026-04-07
+
+### Fixed
+- Tests: 6 `index_folder()` calls in `test_negative_evidence.py` were leaking index files into `~/.code-index/` instead of pytest's `tmp_path` (#222, @MariusAdrian88)
+
+## [1.23.2] — 2026-04-07
+
+### Added
+- `get_blast_radius`: new `include_source` flag returns `source_snippets` (lines referencing the symbol) and `symbols_in_file` (nearby symbol signatures) on each confirmed entry — enables fix-ready context in one call without extra `get_symbol_source`/`get_file_content` round-trips. Optional `source_budget` (default 8000 tokens) caps output size; files prioritised by reference count (#221, @MariusAdrian88)
+
+### Fixed
+- `get_blast_radius`: `decorator_filter` was missing from session cache key, which could return stale filtered results
+
+## [1.23.1] — 2026-04-07
+
+### Changed
+- Switch MCP tool responses from pretty-printed JSON (`indent=2`) to compact JSON (`separators=(',',':')`) — saves 30-40% tokens per response with zero information loss (fixes #219)
+
+## [1.23.0] - 2026-04-07
+
+### Added
+- **AST-based call graph** — extract `call_expression` nodes during tree-sitter parsing and store as `call_references` per symbol. 13 languages supported including constructor calls (`new Foo()`). INDEX_VERSION bumped from 7 to 8 with full v7 backward compatibility (graceful degradation to text heuristic). Confidence upgraded from "low" to "medium" for AST-derived results.
+- **Decorator awareness** — `search_symbols(decorator=...)` filter (case-insensitive substring match), `get_blast_radius(decorator_filter=...)`, and decorator surfacing in `get_file_outline` results. Enables cross-cutting concern discovery (e.g. "which endpoints lack CSRF protection?").
+- **Negative evidence + enforcement signals** — structured `negative_evidence` and top-level `⚠ warning` strings in `get_ranked_context` and `search_symbols` when queries return empty/low-confidence results. `plan_turn` emits `action: "STOP_AND_REPORT_GAP"` on low/none confidence. Reduces LLM hallucination about missing features.
+- **18 new framework route/middleware providers** — Flask, FastAPI, Express, Fastify, Hono, Koa, Gin, Chi, Echo, Fiber, Django (+ DRF), Spring Boot, NestJS, ASP.NET, Rails. Consolidated entry-point decorator regex into `_route_utils.py`. 8 new `FrameworkProfile` definitions.
+
+### Changed
+- **Performance optimizations** — single-pass AST walk for symbols + call sites, lazy `_callers_by_name` index (0ms load when unused), pre-computed `enrich_symbols` file context cache (~60-80% fewer provider calls), fuzzy search early-exit cap at 5× max_results, merged disambiguate + complexity pass, O(1) PHP detection via `languages` set.
+- **`get_dead_code_v2` Signal 2** — uses AST `call_references` lookup (O(1)) on v8 indexes instead of O(N×M) file I/O.
+- `budget_warning` promoted to top-level alongside `_meta` for visibility.
+
+### Fixed
+- Semantic search negative evidence used fragile nested ternary — replaced with named `best_score` variable.
+- Empty query terms guard added to `search_symbols`, `get_ranked_context`, and `plan_turn`.
+
+### Contributors
+- @MariusAdrian88
+
+## [1.22.6] - 2026-04-06
+
+### Fixed
+- **`_merge_hooks()` idempotency** — per-rule dedup instead of per-event. Previously, once any jcodemunch PreToolUse hook was installed, no additional PreToolUse rules could be added by `init --hooks`. Now each rule's command is checked individually, allowing incremental hook installation. Cherry-picked from @DrHayt's PR #214.
+- **Worktree hook-event derivation** — Claude Code sends `{cwd, name}` in WorktreeCreate/WorktreeRemove payloads, not `worktreePath`. Derive path as `{cwd}/.claude/worktrees/{name}`. Legacy fields still accepted. Also outputs resolved path on stdout as Claude Code expects. Cherry-picked from @DrHayt's PR #214.
+- **`config --check` hook validation** — now verifies Python hooks in `~/.claude/settings.json` instead of scanning for shell scripts in `~/.claude/hooks/`. Warns about legacy shell scripts if found. Cherry-picked from @DrHayt's PR #214.
+
+## [1.22.5] - 2026-04-06
+
+### Added
+- **`TWEAKCC.md`** — guide for system prompt routing via [tweakcc](https://github.com/Piebald-AI/tweakcc) as an alternative to hook-based enforcement. Includes 8 prompt rewrites that embed jCodemunch preferences into Claude's core tool descriptions. Cross-referenced from AGENT_HOOKS.md. Credit: [@vadash](https://github.com/vadash). Closes #173.
+
+### Fixed
+- **PreToolUse hook no longer blocks Read** — changed from hard `deny` to a stderr warning. The deny broke the Edit workflow because Claude Code requires Read before Edit, forcing workarounds or env var overrides. Targeted reads (with `offset` or `limit`) are now silently allowed; full-file reads on large code files produce a stderr hint nudging toward `get_file_outline` + `get_symbol_source`. Aligns the Python CLI hook with the documented shell hook design in AGENT_HOOKS.md which explicitly notes "Read is intentionally NOT blocked".
+
+## [1.22.4] - 2026-04-06
+
+### Added
+- **`get_session_snapshot` MCP tool** — compact ~200 token markdown summary of session state (focus files by read count, edited files, key searches, negative evidence). Designed for context injection after compaction to restore session orientation. Contributed by @MariusAdrian88. Closes #211.
+- **PreCompact CLI hook** (`jcodemunch-mcp hook-precompact`) — automatically generates and injects a session snapshot before Claude Code context compaction via the `systemMessage` hook output field. Registered by `jcodemunch-mcp init`.
+- **`sort_by` parameter for `get_context()`** — session journal now supports `sort_by="frequency"` (by read/edit/query count) in addition to the default `sort_by="timestamp"`.
+- **`max_edits` parameter for `get_context()`** — limits the number of edited files returned, consistent with `max_files` and `max_queries`.
+
+## [1.22.3] - 2026-04-06
+
+### Added
+- **`exclude_skip_directories` config** — remove entries from the built-in skip directory list at runtime. Mirrors the existing `exclude_secret_patterns` pattern. Example: set `["proto"]` to index protobuf directories that are skipped by default. Contributed by @DrHayt. Closes #209.
+
+## [1.22.2] - 2026-04-05
+
+### Fixed
+- **CLI init indexing broken** — `run_index()` passed `folder_path=` to `index_folder()` which expects `path=`, causing `unexpected keyword argument` error on `jcodemunch-mcp init`. Closes #208.
+
+## [1.22.1] - 2026-04-05
+
+### Fixed
+- **streamable-http session persistence** — `run_streamable_http_server` previously created a new `StreamableHTTPServerTransport` (and a new `server.run()` coroutine) for every incoming HTTP request, leaving follow-up calls like `tools/list` hitting an uninitialised session and failing with `-32602 INVALID_PARAMS`. The handler now maintains a session map keyed by `mcp-session-id`: on the first request a background `asyncio.Task` runs `transport.connect()` + `server.run()` for the lifetime of the session, and all subsequent requests from the same client are routed to the existing transport. Terminated sessions (e.g. after DELETE) are cleaned up automatically. Includes a 10-second setup timeout with graceful error response. Closes #204.
+- 9 new tests in `test_streamable_http_sessions.py`.
+
+## [1.22.0] - 2026-04-05
+
+### Added
+- **`plan_turn` tool** — opening-move router for any task. Runs BM25 + PageRank against the query, returns confidence level (high/medium/low/none), recommended symbols/files, insertion point suggestions for missing features, prior negative evidence detection, and a budget advisor when turn budget exceeds 60%.
+- **`get_session_context` tool** — returns session history: files read, searches run, edits made, tool call counts. Use to avoid re-reading the same files.
+- **`register_edit` tool** — post-edit cache invalidation. Clears BM25 token cache and search result cache for edited files; optionally reindexes.
+- **Session journal** (`session_journal.py`) — process-lifetime singleton tracking reads, searches, edits, and negative evidence. Bounded at 5000 entries per category with LRU eviction. Thread-safe.
+- **Turn budget** (`turn_budget.py`) — cross-call token accumulator. Injects `budget_warning` + `auto_compacted` into `_meta` when budget runs low. Configurable via `turn_budget_tokens` and `turn_gap_seconds`.
+- **Session state persistence** (`session_state.py`) — save/restore session across restarts. Writes only on clean shutdown via `atexit`. Staleness validated against `indexed_at` on restore. Opt-in via `session_resume: true`.
+- **Negative evidence in `search_symbols`** — when results are empty or below threshold, response includes structured `negative_evidence` with `verdict` (no_implementation_found / low_confidence_matches), `scanned_symbols`, `scanned_files`, `related_existing`.
+- **LRU result cache in `search_symbols`** — 128-entry default, cache key includes `indexed_at` for automatic invalidation on reindex.
+- **10 new config keys**: `negative_evidence_threshold`, `search_result_cache_max`, `session_journal`, `plan_turn_high_threshold`, `plan_turn_medium_threshold`, `turn_budget_tokens`, `turn_gap_seconds`, `session_resume`, `session_max_age_minutes`, `session_max_queries`.
+- **CLAUDE.md policy updates** — routing rules for `plan_turn`, negative evidence handling, budget warning response, and a Read exception note (harness requires Read before Edit/Write).
+- 75 new tests across 10 test files (2191 total, 0 regressions).
 
 ## [1.21.27] - 2026-04-04
 

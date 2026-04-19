@@ -252,3 +252,111 @@ class TestGetRankedContext:
         meta = result["_meta"]
         assert "timing_ms" in meta
         assert "tokens_saved" in meta
+
+
+# ---------------------------------------------------------------------------
+# Diversity-aware budget packing
+# ---------------------------------------------------------------------------
+
+# Repo with many symbols concentrated in one file to test diversity spread
+_CONCENTRATED_REPO = {
+    "models.py": (
+        "class User:\n"
+        "    def get_name(self):\n"
+        "        return self.name\n\n"
+        "    def get_email(self):\n"
+        "        return self.email\n\n"
+        "    def get_age(self):\n"
+        "        return self.age\n\n"
+        "    def get_address(self):\n"
+        "        return self.address\n\n"
+        "    def get_phone(self):\n"
+        "        return self.phone\n"
+    ),
+    "views.py": (
+        "def get_user_view(request):\n"
+        "    return render(request)\n\n"
+        "def get_list_view(request):\n"
+        "    return render(request)\n"
+    ),
+    "utils.py": (
+        "def get_config():\n"
+        "    return {}\n\n"
+        "def get_logger():\n"
+        "    import logging\n"
+        "    return logging.getLogger()\n"
+    ),
+    "main.py": (
+        "from models import User\n"
+        "from views import get_user_view\n"
+        "from utils import get_config\n\n"
+        "def get_app():\n"
+        "    return get_config()\n"
+    ),
+}
+
+
+class TestDiversityPacking:
+    def test_diversity_spreads_across_files(self, tmp_path):
+        """With diversity enabled, results should come from multiple files."""
+        repo, storage = _make_repo(tmp_path, _CONCENTRATED_REPO)
+        result = get_ranked_context(
+            repo, query="get", token_budget=4000, storage_path=storage,
+        )
+        assert "error" not in result
+        items = result["context_items"]
+        if len(items) < 2:
+            pytest.skip("Not enough results to test diversity")
+        files = set()
+        for item in items:
+            # Extract file from symbol_id (format: "file.py::Name#kind")
+            sid = item["symbol_id"]
+            f = sid.split("::")[0] if "::" in sid else ""
+            files.add(f)
+        # With diversity, we should see symbols from at least 3 files
+        assert len(files) >= 3, (
+            f"Expected symbols from >=3 files, got {len(files)}: {files}"
+        )
+
+    def test_file_group_cap_respected(self, tmp_path):
+        """No more than _FILE_GROUP_CAP symbols from a single file."""
+        from jcodemunch_mcp.tools.get_ranked_context import _FILE_GROUP_CAP
+        repo, storage = _make_repo(tmp_path, _CONCENTRATED_REPO)
+        result = get_ranked_context(
+            repo, query="get", token_budget=8000, storage_path=storage,
+        )
+        assert "error" not in result
+        file_counts: dict[str, int] = {}
+        for item in result["context_items"]:
+            sid = item["symbol_id"]
+            f = sid.split("::")[0] if "::" in sid else ""
+            file_counts[f] = file_counts.get(f, 0) + 1
+        for f, count in file_counts.items():
+            assert count <= _FILE_GROUP_CAP, (
+                f"File '{f}' has {count} symbols, exceeds cap {_FILE_GROUP_CAP}"
+            )
+
+    def test_budget_still_respected_with_diversity(self, tmp_path):
+        """Diversity packing must still respect the token budget."""
+        repo, storage = _make_repo(tmp_path, _CONCENTRATED_REPO)
+        budget = 50
+        result = get_ranked_context(
+            repo, query="get", token_budget=budget, storage_path=storage,
+        )
+        assert "error" not in result
+        assert result["total_tokens"] <= budget
+
+    def test_pack_budget_no_diversity_fallback(self, tmp_path):
+        """_pack_budget with diversity=False behaves like the old greedy packer."""
+        from jcodemunch_mcp.tools.get_ranked_context import _pack_budget
+        syms = [
+            {"id": f"a.py::f{i}#function", "file": "a.py", "byte_length": 20}
+            for i in range(5)
+        ]
+        scored = [(10.0 - i, sym) for i, sym in enumerate(syms)]
+        def get_tok(sym):
+            return "x" * 20, 5
+        packed, total = _pack_budget(scored, 100, get_tok, diversity=False)
+        # Without diversity, all 5 from same file should be packed
+        assert len(packed) == 5
+        assert total == 25

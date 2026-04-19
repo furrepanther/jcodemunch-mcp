@@ -28,10 +28,12 @@ _JS_REEXPORT = re.compile(r"""(?:^|\n)\s*export\s+\{[^}]*\}\s+from\s+['"]([^'"]+
 _JS_DYNAMIC_IMPORT = re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)""", re.MULTILINE)
 
 # Python: from .module import A, B  /  import os
+# Allow optional leading whitespace so function-local imports inside def/class
+# bodies are also captured (common pattern for breaking circular imports).
 _PY_FROM = re.compile(
-    r"""^from\s+(\.{0,4}[\w.]*)\s+import\s+(.+)$""", re.MULTILINE
+    r"""^[ \t]*from\s+(\.{0,4}[\w.]*)\s+import\s+(.+)$""", re.MULTILINE
 )
-_PY_IMPORT = re.compile(r"""^import\s+([\w.,][^\n]*)$""", re.MULTILINE)
+_PY_IMPORT = re.compile(r"""^[ \t]*import\s+([\w.,][^\n]*)$""", re.MULTILINE)
 
 # Go: import "pkg"  or import ( ... )
 _GO_IMPORT_BLOCK = re.compile(r"""import\s*\((.*?)\)""", re.DOTALL)
@@ -49,6 +51,13 @@ _C_INCLUDE = re.compile(r"""^#include\s+[<"]([^>"]+)[>"]""", re.MULTILINE)
 
 # Assembly: .include "foo" / .incbin "foo" / %include "foo"
 _ASM_INCLUDE = re.compile(r"""^\s*[.%]include\s+["']([^"']+)["']""", re.MULTILINE | re.IGNORECASE)
+
+# VHDL: library ieee; / use ieee.std_logic_1164.all;
+_VHDL_LIBRARY = re.compile(r"""^\s*library\s+(\w+)\s*;""", re.MULTILINE | re.IGNORECASE)
+_VHDL_USE = re.compile(r"""^\s*use\s+([\w.]+)\s*;""", re.MULTILINE | re.IGNORECASE)
+
+# Verilog/SystemVerilog: `include "foo.vh"
+_VERILOG_INCLUDE = re.compile(r"""^\s*`include\s+["']([^"']+)["']""", re.MULTILINE)
 
 # Ruby: require 'foo' / require_relative 'bar'
 _RUBY_REQUIRE = re.compile(r"""(?:require|require_relative)\s+['"]([^'"]+)['"]""", re.MULTILINE)
@@ -213,6 +222,26 @@ def _extract_c_imports(content: str) -> list[dict]:
 
 def _extract_asm_imports(content: str) -> list[dict]:
     return [{"specifier": m.group(1), "names": []} for m in _ASM_INCLUDE.finditer(content)]
+
+
+def _extract_vhdl_imports(content: str) -> list[dict]:
+    edges = []
+    seen: set[str] = set()
+    for m in _VHDL_LIBRARY.finditer(content):
+        lib = m.group(1).lower()
+        if lib != "work" and lib not in seen:
+            seen.add(lib)
+            edges.append({"specifier": lib, "names": []})
+    for m in _VHDL_USE.finditer(content):
+        spec = m.group(1)
+        if spec not in seen:
+            seen.add(spec)
+            edges.append({"specifier": spec, "names": []})
+    return edges
+
+
+def _extract_verilog_imports(content: str) -> list[dict]:
+    return [{"specifier": m.group(1), "names": []} for m in _VERILOG_INCLUDE.finditer(content)]
 
 
 def _extract_ruby_imports(content: str) -> list[dict]:
@@ -406,6 +435,7 @@ _LANGUAGE_EXTRACTORS = {
     "c": _extract_c_imports,
     "cpp": _extract_c_imports,
     "objc": _extract_c_imports,
+    "arduino": _extract_c_imports,
     "ruby": _extract_ruby_imports,
     "csharp": _extract_csharp_imports,
     "php": _extract_php_imports,
@@ -415,6 +445,8 @@ _LANGUAGE_EXTRACTORS = {
     "dart": _extract_dart_imports,
     "sql": _extract_sql_dbt_imports,
     "asm": _extract_asm_imports,
+    "vhdl": _extract_vhdl_imports,
+    "verilog": _extract_verilog_imports,
 }
 
 
@@ -563,6 +595,64 @@ def _candidates(base: str) -> list[str]:
         cands.append(stem + ".ts")
         cands.append(stem + ".tsx")
     return cands
+
+
+# Cache: frozenset(source_files) -> tuple of source root prefixes ("" = repo root).
+# Keyed by the frozenset itself (not id) so the cache stays correct across
+# unrelated call sites that happen to reuse memory addresses. Frozenset hashing
+# is cached by Python after the first call, so repeat lookups are O(1).
+_python_roots_cache: dict[frozenset, tuple[str, ...]] = {}
+
+
+def _python_source_roots(source_files) -> tuple[str, ...]:
+    """Detect Python package source roots from the indexed file set.
+
+    A Python source root is the parent directory of a top-level package, where
+    a top-level package is a directory containing ``__init__.py`` whose parent
+    directory does NOT contain ``__init__.py``. For modern PEP 420 namespace
+    packages (no __init__.py at all), falls back to top-level directories
+    that contain at least one .py file. Repo root is included as ``""``.
+    """
+    # Normalize to frozenset for hashable cache key. set inputs become frozenset;
+    # frozenset inputs pass through unchanged.
+    cache_key = source_files if isinstance(source_files, frozenset) else frozenset(source_files)
+    cached = _python_roots_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Collect every directory that has an __init__.py
+    package_dirs: set[str] = set()
+    for f in source_files:
+        if f.endswith("/__init__.py"):
+            package_dirs.add(f[: -len("/__init__.py")])
+        elif f == "__init__.py":
+            package_dirs.add("")
+
+    roots: set[str] = set()
+    if package_dirs:
+        # A "top-level" package is one whose parent is NOT itself a package.
+        for d in package_dirs:
+            parent = posixpath.dirname(d)
+            if parent not in package_dirs:
+                roots.add(parent)
+    else:
+        # PEP 420 namespace packages: fall back to top-level directories
+        # containing .py files.
+        for f in source_files:
+            if f.endswith(".py"):
+                top = f.split("/", 1)[0] if "/" in f else ""
+                roots.add(top)
+
+    # Always include repo root as a fallback
+    roots.add("")
+    result = tuple(sorted(roots))
+    _python_roots_cache[cache_key] = result
+    return result
+
+
+def _clear_python_roots_cache() -> None:
+    """Test helper: drop the Python source roots cache between tests."""
+    _python_roots_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +816,29 @@ def resolve_specifier(
     for c in _candidates(specifier):
         if c in source_files:
             return c
+
+    # Python module-style absolute import: 'app.notifications.mentions' →
+    # 'app/notifications/mentions.py'. Also try prefixing with detected
+    # Python source roots so layouts like backend/app/... or src/app/...
+    # resolve correctly. Triggered when the specifier looks like a Python
+    # module path: contains dots, no slashes, no backslashes, no leading dot.
+    if (
+        "." in specifier
+        and "/" not in specifier
+        and "\\" not in specifier
+        and not specifier.startswith(".")
+    ):
+        module_path = specifier.replace(".", "/")
+        # Try direct (repo-root layout)
+        for c in _candidates(module_path):
+            if c in source_files:
+                return c
+        # Try with each detected Python source root as a prefix
+        for root in _python_source_roots(source_files):
+            prefixed = f"{root}/{module_path}" if root else module_path
+            for c in _candidates(prefixed):
+                if c in source_files:
+                    return c
 
     # Alias expansion (tsconfig compilerOptions.paths: @/*, $lib/*, etc.)
     if alias_map:

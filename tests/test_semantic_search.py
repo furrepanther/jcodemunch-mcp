@@ -383,6 +383,23 @@ def test_embedding_store_persist_and_retrieve(tmp_path):
     assert es2.get_dimension() == 4
 
 
+def test_embedding_store_get_all_ids(tmp_path):
+    """get_all_ids returns only symbol IDs without decoding embedding blobs."""
+    from jcodemunch_mcp.storage.embedding_store import EmbeddingStore
+
+    symbols = [_make_symbol("s1", "foo"), _make_symbol("s2", "bar")]
+    store, _ = _seed(tmp_path, symbols)
+    db_path = store._sqlite._db_path("test", "semantic")
+
+    es = EmbeddingStore(db_path)
+    assert es.get_all_ids() == set()
+
+    es.set_many({"s1": [1.0, 0.0], "s2": [0.0, 1.0]})
+    ids = es.get_all_ids()
+    assert ids == {"s1", "s2"}
+    assert isinstance(ids, set)
+
+
 def test_embedding_store_delete_many(tmp_path):
     from jcodemunch_mcp.storage.embedding_store import EmbeddingStore
 

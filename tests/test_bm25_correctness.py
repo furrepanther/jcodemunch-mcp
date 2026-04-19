@@ -5,6 +5,8 @@ import math
 from jcodemunch_mcp.tools.search_symbols import (
     _sym_tokens,
     _compute_bm25,
+    _identity_score,
+    _bm25_breakdown,
     _FIELD_REPS,
 )
 
@@ -80,9 +82,11 @@ class TestComputeBM25Canonical:
         """avgdl must be computed from unique token counts, not repeated bag lengths."""
         syms = [self._make_sym("parse"), self._make_sym("render"), self._make_sym("connect")]
         _, avgdl, _ = _compute_bm25(syms)
-        # Each symbol: name token × 3 field reps → 1 unique token per symbol
-        # avgdl should be 1.0 (unique), not 3.0 (repeated bag)
-        assert avgdl == 1.0, f"Expected avgdl=1.0 (unique), got {avgdl}"
+        # Each symbol: name token × 3 field reps → unique tokens per symbol
+        # avgdl should reflect unique count, NOT the 3× repeated bag length.
+        # With jCore tokenizer, stems/expansions may add tokens (e.g. "render" -> ["render", "rend"]).
+        # Key invariant: avgdl < 3.0 (not inflated by field reps)
+        assert avgdl < 3.0, f"avgdl inflated by field reps: {avgdl}"
 
     def test_compute_bm25_rewrites_dl(self):
         """_compute_bm25 must overwrite stale _dl values on retained symbols (T11)."""
@@ -147,3 +151,88 @@ class TestComputeBM25Canonical:
             f"After rebuild, _dl={sym['_dl']} should be canonical {canonical_dl}, "
             f"not inflated {inflated_dl}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Identity channel tests (Gap 3 partial)
+# ---------------------------------------------------------------------------
+
+class TestIdentityChannel:
+    """Tests for the _identity_score function that replaces the 50.0 hack."""
+
+    def test_exact_name_match(self):
+        sym = {"name": "process_data", "id": "src/utils.py::process_data"}
+        assert _identity_score(sym, "process_data") == 50.0
+
+    def test_exact_id_match(self):
+        sym = {"name": "process_data", "id": "src/utils.py::process_data"}
+        assert _identity_score(sym, "src/utils.py::process_data") == 50.0
+
+    def test_name_prefix_match(self):
+        sym = {"name": "process_data", "id": "src/utils.py::process_data"}
+        score = _identity_score(sym, "process")
+        assert score == 30.0
+
+    def test_id_segment_match(self):
+        sym = {"name": "IndexStore", "id": "src/storage/index_store.py::IndexStore"}
+        score = _identity_score(sym, "index_store")
+        # "index_store" appears in the ID "src/storage/index_store.py::indexstore"
+        assert score == 20.0
+
+    def test_no_match(self):
+        sym = {"name": "process_data", "id": "src/utils.py::process_data"}
+        assert _identity_score(sym, "completely_unrelated") == 0.0
+
+    def test_empty_query(self):
+        sym = {"name": "process_data", "id": "src/utils.py::process_data"}
+        assert _identity_score(sym, "") == 0.0
+
+    def test_case_insensitive(self):
+        sym = {"name": "ProcessData", "id": "src/utils.py::ProcessData"}
+        assert _identity_score(sym, "processdata") == 50.0
+
+    def test_exact_beats_prefix(self):
+        """Exact match (50) must score higher than prefix match (30)."""
+        sym = {"name": "get_symbol", "id": "src/tools.py::get_symbol"}
+        exact = _identity_score(sym, "get_symbol")
+        prefix = _identity_score(sym, "get_sym")
+        assert exact > prefix
+
+    def test_prefix_beats_segment(self):
+        """Prefix match (30) must score higher than segment match (20)."""
+        sym = {"name": "get_symbol_source", "id": "src/tools/get_symbol.py::get_symbol_source"}
+        prefix = _identity_score(sym, "get_symbol")
+        segment = _identity_score({"name": "IndexStore", "id": "src/tools/get_symbol.py::IndexStore"}, "get_symbol")
+        assert prefix > segment
+
+    def test_breakdown_includes_identity(self):
+        """Debug breakdown should include 'identity' and 'identity_type' fields."""
+        sym = {
+            "name": "helper",
+            "signature": "helper()",
+            "summary": "",
+            "docstring": "",
+            "keywords": [],
+        }
+        _sym_tokens(sym)
+        idf, avgdl, _ = _compute_bm25([sym])
+        breakdown = _bm25_breakdown(sym, ["helper"], idf, avgdl)
+        assert "identity" in breakdown
+        assert "identity_type" in breakdown
+        assert breakdown["identity"] == 50.0
+        assert breakdown["identity_type"] == "exact"
+
+    def test_breakdown_no_match_identity_type(self):
+        """When no identity match, identity_type should be 'none'."""
+        sym = {
+            "name": "helper",
+            "signature": "helper()",
+            "summary": "",
+            "docstring": "",
+            "keywords": [],
+        }
+        _sym_tokens(sym)
+        idf, avgdl, _ = _compute_bm25([sym])
+        breakdown = _bm25_breakdown(sym, ["unrelated"], idf, avgdl)
+        assert breakdown["identity"] == 0.0
+        assert breakdown["identity_type"] == "none"

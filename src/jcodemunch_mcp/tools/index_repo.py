@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -14,7 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from ..parser import get_language_for_path
-from ..security import is_secret_file, is_binary_extension, get_max_index_files, get_extra_ignore_patterns, SKIP_PATTERNS
+from ..security import is_secret_file, is_binary_extension, get_max_index_files, get_extra_ignore_patterns, get_skip_patterns
 from ..storage import IndexStore
 from ._indexing_pipeline import (
     file_languages_for_paths as _file_languages_for_paths,
@@ -117,7 +117,7 @@ async def fetch_repo_tree(owner: str, repo: str, token: Optional[str] = None) ->
 def should_skip_file(path: str) -> bool:
     """Check if file should be skipped based on path patterns."""
     normalized = path.replace("\\", "/")
-    for pattern in SKIP_PATTERNS:
+    for pattern in get_skip_patterns():
         if pattern.endswith("/"):
             # Directory pattern: match only complete path segments to avoid
             # false positives on names like "rebuild/" or "proto-utils/"
@@ -278,6 +278,7 @@ async def index_repo(
     storage_path: Optional[str] = None,
     incremental: bool = True,
     extra_ignore_patterns: Optional[list] = None,
+    progress_cb: "Optional[Callable[[int, int, str], None]]" = None,
 ) -> dict:
     """Index a GitHub repository.
     
@@ -384,14 +385,21 @@ async def index_repo(
 
         # Fetch file contents concurrently (only files that need updating)
         semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
+        _fetch_total = len(files_to_fetch)
+        _fetch_done = 0
 
         async def fetch_with_limit(path: str) -> tuple[str, str]:
+            nonlocal _fetch_done
             async with semaphore:
                 try:
                     content = await fetch_file_content(owner, repo, path, github_token)
                     return path, content
                 except Exception:
                     return path, ""
+                finally:
+                    _fetch_done += 1
+                    if progress_cb:
+                        progress_cb(_fetch_done, _fetch_total, path)
 
         tasks = [fetch_with_limit(path) for path in files_to_fetch]
         file_contents = await asyncio.gather(*tasks)

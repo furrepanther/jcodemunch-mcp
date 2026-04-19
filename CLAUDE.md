@@ -1,27 +1,49 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.21.27 (published to PyPI)
-- **INDEX_VERSION:** 7
-- **Tests:** 2086 passed, 5 skipped
+- **Version:** 1.59.0 (published to PyPI)
+- **INDEX_VERSION:** 9
+- **Tests:** 3404 passed, 6 skipped
 - **Python:** >=3.10
 
 ## Key Files
 ```
 src/jcodemunch_mcp/
   server.py            # MCP dispatcher (async); CLI subcommand dispatch, auth/rate-limit middleware
+  watcher.py           # WatcherManager class (dynamic folder watching); watch_folders() wrapper
+  progress.py          # MCP progress notifications; ProgressReporter (thread-safe, monotonic), make_progress_notify() bridge
   security.py          # Path validation, skip patterns, file caps
+  redact.py            # Response-level secret redaction; regex patterns for AWS/GCP/Azure/JWT/GitHub/Slack/PEM/API keys/private IPs; redact_dict() post-processor
   config.py            # JSONC config: global + per-project layering, env var fallback, language/tool gating
+  agent_selector.py    # Complexity scoring + model routing (off/manual/auto); default provider batting orders
   cli/
     init.py            # `jcodemunch-mcp init` — one-command onboarding (client detection, config patching, CLAUDE.md, Cursor rules, Windsurf rules, hooks); --demo flag
-    hooks.py           # PreToolUse (Read interceptor) + PostToolUse (auto-reindex) hook handlers for Claude Code
+    hooks.py           # PreToolUse (Read interceptor) + PostToolUse (auto-reindex) + PreCompact (session snapshot) + TaskCompleted (post-task diagnostics) + SubagentStart (repo briefing) hook handlers for Claude Code
+  groq/
+    cli.py             # `gcm` CLI entrypoint — codebase Q&A (single question + --chat mode)
+    config.py          # GcmConfig dataclass: GROQ_API_KEY, model, token_budget, system prompt
+    retriever.py       # Bridge to jCodeMunch: ensure_indexed(), retrieve_context()
+    inference.py       # Groq API streaming + batch via OpenAI-compatible client
   parser/
     languages.py       # LANGUAGE_REGISTRY, extension → language map, LanguageSpec
     extractor.py       # parse_file() dispatch; custom parsers for Erlang, Fortran, SQL, Razor
     imports.py         # Regex import extraction (19 languages); extract_imports(), resolve_specifier(), build_psr4_map()
     fqn.py             # PHP FQN ↔ symbol_id translation (PSR-4); symbol_to_fqn(), fqn_to_symbol()
+  encoding/
+    __init__.py          # Dispatcher: encode_response(tool, response, format) — auto/compact/json
+    format.py            # MUNCH on-wire primitives: header, legends (@N), scalars, CSV tables
+    gate.py              # 15% savings threshold (JCODEMUNCH_ENCODING_THRESHOLD override)
+    generic.py           # Shape-sniffer fallback encoder (covers all tools w/o custom encoder)
+    decoder.py           # Public decode() — rehydrates MUNCH payloads back to dicts
+    schemas/             # Per-tool custom encoders (tier-1, phase 2+); auto-discovered registry
   storage/
-    sqlite_store.py    # CodeIndex, save/load/incremental_save, WAL-aware LRU cache (_db_mtime_ns)
+    sqlite_store.py    # CodeIndex, save/load/incremental_save, WAL-aware LRU cache (_db_mtime_ns); get_source_root()
+  embeddings/
+    local_encoder.py   # Bundled ONNX local encoder (all-MiniLM-L6-v2, 384-dim); WordPiece tokenizer, encode_batch(), download_model()
+  enrichment/
+    lsp_bridge.py      # LSP bridge — opt-in compiler-grade call graph resolution via pyright/gopls/ts-language-server/rust-analyzer; LSPServer lifecycle, LSPBridge multi-server manager, enrich_call_graph_with_lsp() + enrich_dispatch_edges() (interface/trait dispatch resolution)
+  retrieval/
+    signal_fusion.py   # Weighted Reciprocal Rank (WRR) fusion: lexical + structural + similarity + identity channels
   summarizer/
     batch_summarize.py # 3-tier: Anthropic > Gemini > OpenAI-compat > signature fallback
   tools/
@@ -40,10 +62,21 @@ src/jcodemunch_mcp/
     _call_graph.py       # Shared AST-derived call-graph helpers (callers/callees, BFS)
     get_call_hierarchy.py # get_call_hierarchy: callers+callees for a symbol, N levels deep
     get_impact_preview.py # get_impact_preview: transitive "what breaks?" analysis
+    plan_refactoring.py   # plan_refactoring: edit-ready plans for rename/move/extract/signature refactorings
     get_symbol_complexity.py  # get_symbol_complexity: cyclomatic/nesting/param_count for a symbol
     get_churn_rate.py         # get_churn_rate: git commit count for file or symbol over N days
+    get_symbol_provenance.py  # get_symbol_provenance: full git archaeology per symbol — authorship lineage, semantic commit classification, evolution narrative
+    get_pr_risk_profile.py    # get_pr_risk_profile: unified PR/branch risk assessment — fuses blast radius + complexity + churn + test gaps + volume into composite score
     get_hotspots.py           # get_hotspots: top-N high-risk symbols by complexity x churn
+    get_tectonic_map.py       # get_tectonic_map: logical module topology via 3-signal fusion (structural+behavioral+temporal) + label propagation
+    get_signal_chains.py      # get_signal_chains: entry-point-to-leaf pathway discovery; traces how HTTP/CLI/task/event signals propagate through the call graph; discovery + lookup modes
+    render_diagram.py         # render_diagram: universal Mermaid renderer; auto-detects source tool, picks optimal diagram type (flowchart/sequence), encodes metadata as visual signals; 3 themes, smart pruning; optional `open_in_viewer` (config-gated, spawns mmd-viewer)
+    mermaid_viewer.py         # mmd-viewer spawn helper for render_diagram; resolve_viewer_path/open_diagram/cleanup_temp_dir; jcm- prefix for safe cleanup; config-gated via render_diagram_viewer_enabled + mermaid_viewer_path
+    get_project_intel.py      # get_project_intel: auto-discover+parse non-code knowledge (Dockerfiles, CI configs, compose, K8s, .env templates, Makefiles, scripts); cross-references to code symbols; 6 categories
     get_repo_health.py        # get_repo_health: one-call triage snapshot (delegate aggregator)
+    get_untested_symbols.py   # get_untested_symbols: find functions with no test-file reachability (import graph + name matching)
+    search_ast.py             # search_ast: cross-language AST pattern matching; 10 preset anti-patterns + custom mini-DSL (call:, string:, comment:, nesting:, loops:, lines:); enriched with symbol context
+    winnow_symbols.py         # winnow_symbols: multi-axis constraint-chain query; AND-intersects kind/language/name/file/complexity/decorator/calls/summary/churn in one round trip; ranks by importance/complexity/churn/name
     audit_agent_config.py    # audit_agent_config: token waste audit for CLAUDE.md, .cursorrules, etc.; cross-refs against index
 ```
 
@@ -55,12 +88,18 @@ src/jcodemunch_mcp/
 | `watch <paths>` | File watcher — auto-reindex on change |
 | `watch-claude` | Auto-discover and watch Claude Code worktrees |
 | `hook-event create\|remove` | Record a worktree lifecycle event (called by Claude Code hooks) |
+| `index [target]` | Index a local folder (default: `.`) or GitHub repo (`owner/repo`). One command, no init required |
 | `index-file <path>` | Re-index a single file within an existing indexed folder (used by PostToolUse hooks) |
 | `config` | Print effective configuration grouped by concern |
 | `config --check` | Also validate prerequisites (storage writable, AI pkg installed, HTTP pkgs present) |
 | `config --upgrade` | Add missing keys from current template to existing config.jsonc, preserving user values |
+| `download-model` | Download bundled ONNX embedding model (all-MiniLM-L6-v2) for zero-config semantic search; `--target-dir` override |
+| `install-pack [id]` | Download and install a Starter Pack pre-built index; `--list` for catalog, `--license KEY` for premium |
 | `hook-pretooluse` | PreToolUse hook: intercept Read on large code files, suggest jCodemunch (reads JSON stdin) |
 | `hook-posttooluse` | PostToolUse hook: auto-reindex files after Edit/Write (reads JSON stdin) |
+| `hook-precompact` | PreCompact hook: generate session snapshot before context compaction (reads JSON stdin) |
+| `hook-taskcomplete` | TaskCompleted hook: post-task diagnostics — dead code, untested symbols, dangling refs (reads JSON stdin) |
+| `hook-subagent-start` | SubagentStart hook: inject condensed repo orientation for spawned agents (reads JSON stdin) |
 
 ## Architecture Notes
 - `index_folder` is **synchronous** — dispatched via `asyncio.to_thread()` in server.py to avoid blocking the event loop
@@ -95,14 +134,17 @@ Tree-sitter grammar lacks clean named fields for these — custom regex extracto
 | `JCODEMUNCH_RATE_LIMIT` | 0 | Max requests/minute per client IP in HTTP transport (0 = disabled) |
 | `JCODEMUNCH_REDACT_SOURCE_ROOT` | 0 | Set 1 to replace source_root with display_name in responses |
 | `JCODEMUNCH_SHARE_SAVINGS` | 1 | Set 0 to disable anonymous token savings telemetry |
+| `JCODEMUNCH_REDACT_RESPONSE_SECRETS` | 1 | Set 0 to disable response-level secret redaction (AWS/GCP/Azure/JWT/etc.) |
 | `JCODEMUNCH_STATS_FILE_INTERVAL` | 3 | Calls between session_stats.json writes; 0 = disable |
 | `ANTHROPIC_API_KEY` | — | Enables Claude Haiku summaries (`pip install jcodemunch-mcp[anthropic]`) |
 | `GOOGLE_API_KEY` | — | Enables Gemini Flash summaries (`pip install jcodemunch-mcp[gemini]`) |
 | `OPENAI_API_BASE` | — | Local LLM endpoint (Ollama, LM Studio) |
 | `OPENAI_WIRE_API` | — | Set `responses` to use OpenAI Responses API instead of chat/completions |
 | `OPENROUTER_API_KEY` | — | Enables OpenRouter summaries (default model: `meta-llama/llama-3.3-70b-instruct:free`) |
+| `JCODEMUNCH_LOCAL_EMBED_MODEL` | — | Override path to bundled ONNX model directory (default: `~/.code-index/models/all-MiniLM-L6-v2/`) |
 | `GEMINI_EMBED_TASK_AWARE` | 1 | Set `0`/`false`/`no`/`off` to disable task-type hints (`RETRIEVAL_DOCUMENT` / `CODE_RETRIEVAL_QUERY`) when using Gemini embeddings |
 | `JCODEMUNCH_CROSS_REPO_DEFAULT` | 0 | Set 1 to enable cross-repo traversal by default in find_importers, get_blast_radius, get_dependency_graph |
+| `JCODEMUNCH_EVENT_LOG` | — | Set `1` to write `_pulse.json` on every tool call (per-call activity signal for dashboards) |
 
 ## PR / Issue History
 See `git log` and CHANGELOG.md. Active contributors: MariusAdrian88, DrHayt, tmeckel, drax1222.

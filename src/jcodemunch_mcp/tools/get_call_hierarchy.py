@@ -95,6 +95,88 @@ def get_call_hierarchy(
         depth_reached = max(depth_reached, dr)
 
     elapsed = (time.perf_counter() - start) * 1000
+
+    # Build dispatches section from dispatch edges
+    ctx_meta = getattr(index, "context_metadata", None) or {}
+    dispatch_edge_data = ctx_meta.get("dispatch_edges", [])
+    dispatches: list[dict] = []
+    if dispatch_edge_data:
+        # Group by (interface_name, method_name)
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for de in dispatch_edge_data:
+            key = (de.get("interface_name", ""), de.get("method_name", ""))
+            grouped.setdefault(key, []).append(de)
+        for (iface, method), impls in grouped.items():
+            dispatches.append({
+                "interface": iface,
+                "method": method,
+                "implementations": [
+                    {
+                        "name": imp.get("impl_name", ""),
+                        "file": imp.get("impl_file", ""),
+                        "line": imp.get("impl_line", 0),
+                    }
+                    for imp in impls
+                ],
+            })
+
+    # Determine methodology based on available data
+    get_callers = getattr(index, "get_callers_by_name", None)
+    callers_by_name = get_callers() if get_callers else None
+    has_call_data = bool(callers_by_name)
+    has_lsp_data = bool(ctx_meta.get("lsp_edges"))
+    has_dispatch_data = bool(dispatch_edge_data)
+    if has_dispatch_data:
+        methodology = "lsp_dispatch_enriched"
+        confidence = "high"
+        source = "lsp_bridge + dispatch_resolution + ast_call_references"
+        tip = (
+            "LSP dispatch-enriched: compiler-grade resolution via language servers with "
+            "interface/trait dispatch resolution — concrete implementations of interface "
+            "methods are resolved via textDocument/implementation. Each edge has a "
+            "'resolution' field: lsp_dispatch (interface dispatch), lsp_resolved "
+            "(compiler-grade), ast_resolved (direct AST), ast_inferred (import graph), "
+            "or text_matched (heuristic)."
+        )
+    elif has_lsp_data:
+        methodology = "lsp_enriched"
+        confidence = "high"
+        source = "lsp_bridge + ast_call_references"
+        tip = (
+            "LSP-enriched: compiler-grade resolution via language servers (pyright, gopls, "
+            "typescript-language-server, rust-analyzer) for highest confidence, with AST "
+            "call_references and text heuristic as fallback layers. Each edge has a "
+            "'resolution' field: lsp_resolved (compiler-grade), ast_resolved (direct AST), "
+            "ast_inferred (import graph), or text_matched (heuristic)."
+        )
+    elif has_call_data:
+        methodology = "ast_call_references"
+        confidence = "medium"
+        source = "ast_call_references"
+        tip = (
+            "AST-based: call references extracted from tree-sitter AST during indexing. "
+            "More precise than text heuristic, but still approximate for dynamic dispatch. "
+            "Each edge has a 'resolution' field: ast_resolved (direct AST match), "
+            "ast_inferred (resolved via import graph), or text_matched (heuristic). "
+            "Enable LSP enrichment for compiler-grade resolution."
+        )
+    else:
+        methodology = "text_heuristic"
+        confidence = "low"
+        source = "text_heuristic"
+        tip = (
+            "Text-heuristic: callers = symbols in importing files that mention this "
+            "name as a word token; callees = imported symbols mentioned in this "
+            "symbol's body. May have false positives for common names or dynamic "
+            "dispatch. Use get_impact_preview for a transitive 'what breaks?' view."
+        )
+
+    # Summarize resolution tiers across all edges
+    resolution_counts: dict[str, int] = {}
+    for edge in callers + callees:
+        r = edge.get("resolution", "unknown")
+        resolution_counts[r] = resolution_counts.get(r, 0) + 1
+
     return {
         "repo": f"{owner}/{name}",
         "symbol": {
@@ -111,16 +193,13 @@ def get_call_hierarchy(
         "callee_count": len(callees),
         "callers": callers,
         "callees": callees,
+        "dispatches": dispatches,
         "_meta": {
             "timing_ms": round(elapsed, 1),
-            "methodology": "text_heuristic",
-            "confidence_level": "low",
-            "source": "text_heuristic",
-            "tip": (
-                "Text-heuristic: callers = symbols in importing files that mention this "
-                "name as a word token; callees = imported symbols mentioned in this "
-                "symbol's body. May have false positives for common names or dynamic "
-                "dispatch. Use get_impact_preview for a transitive 'what breaks?' view."
-            ),
+            "methodology": methodology,
+            "confidence_level": confidence,
+            "source": source,
+            "resolution_tiers": resolution_counts,
+            "tip": tip,
         },
     }

@@ -8,7 +8,7 @@ one deliberate pass so that the first semantic query returns immediately.
 import logging
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .. import config as _config
 from ..storage import IndexStore
@@ -26,10 +26,16 @@ def _detect_provider() -> Optional[tuple[str, str]]:
     """Return (provider_name, model_name) or None when nothing is configured.
 
     Priority order (first match wins):
+    0. local_onnx             — ``onnxruntime`` installed + ONNX model present
     1. sentence-transformers  — ``embed_model`` config key or ``JCODEMUNCH_EMBED_MODEL`` env var
     2. Gemini                 — ``GOOGLE_API_KEY`` + ``GOOGLE_EMBED_MODEL``
     3. OpenAI                 — ``OPENAI_API_KEY`` + ``OPENAI_EMBED_MODEL``
     """
+    # Priority 0: bundled ONNX local encoder (zero-config)
+    from ..embeddings.local_encoder import is_onnxruntime_available, is_model_available, MODEL_NAME
+    if is_onnxruntime_available() and is_model_available():
+        return ("local_onnx", MODEL_NAME)
+
     st_model = (_config.get("embed_model", "") or os.environ.get("JCODEMUNCH_EMBED_MODEL", "")).strip()
     if st_model:
         return ("sentence_transformers", st_model)
@@ -134,6 +140,11 @@ def _embed_gemini(
     return results
 
 
+def _embed_local_onnx(texts: list[str], model_name: str) -> list[list[float]]:
+    from ..embeddings.local_encoder import encode_batch
+    return encode_batch(texts)
+
+
 def _embed_openai(texts: list[str], model_name: str) -> list[list[float]]:
     try:
         from openai import OpenAI  # type: ignore[import]
@@ -162,6 +173,8 @@ def embed_texts(
     ``"CODE_RETRIEVAL_QUERY"`` when embedding a search query.  Other providers
     silently ignore the parameter.
     """
+    if provider == "local_onnx":
+        return _embed_local_onnx(texts, model)
     if provider == "sentence_transformers":
         return _embed_sentence_transformers(texts, model)
     if provider == "gemini":
@@ -188,6 +201,7 @@ def embed_repo(
     batch_size: int = EMBED_BATCH_SIZE,
     force: bool = False,
     storage_path: Optional[str] = None,
+    progress_cb: "Optional[Callable[[int, int, str], None]]" = None,
 ) -> dict:
     """Precompute and store all symbol embeddings for a repository.
 
@@ -214,7 +228,8 @@ def embed_repo(
         return {
             "error": "no_embedding_provider",
             "message": (
-                "No embedding provider is configured. Set one of: "
+                "No embedding provider is configured. Options: "
+                "pip install 'jcodemunch-mcp[local-embed]' (zero-config ONNX, recommended), "
                 "JCODEMUNCH_EMBED_MODEL (sentence-transformers, free/local), "
                 "GOOGLE_API_KEY + GOOGLE_EMBED_MODEL (Gemini), or "
                 "OPENAI_API_KEY + OPENAI_EMBED_MODEL (OpenAI)."
@@ -259,7 +274,7 @@ def embed_repo(
         emb_store.clear()
         symbols_to_embed = list(index.symbols)
     else:
-        existing_ids = set(emb_store.get_all().keys())
+        existing_ids = emb_store.get_all_ids()
         symbols_to_embed = [s for s in index.symbols if s["id"] not in existing_ids]
 
     if not symbols_to_embed:
@@ -279,7 +294,8 @@ def embed_repo(
     dim: Optional[int] = stored_dim
     batch_size = max(1, min(batch_size, 200))
 
-    for i in range(0, len(symbols_to_embed), batch_size):
+    _embed_total = len(symbols_to_embed)
+    for i in range(0, _embed_total, batch_size):
         batch = symbols_to_embed[i : i + batch_size]
         texts = [_sym_text(s) for s in batch]
         try:
@@ -287,6 +303,8 @@ def embed_repo(
         except Exception as exc:
             logger.warning("embed_repo: batch %d failed: %s", i // batch_size, exc)
             error_count += len(batch)
+            if progress_cb:
+                progress_cb(min(i + len(batch), _embed_total), _embed_total, "")
             continue
 
         if dim is None and vecs:
@@ -296,6 +314,8 @@ def embed_repo(
 
         emb_store.set_many({batch[j]["id"]: vecs[j] for j in range(len(batch))})
         embedded_count += len(batch)
+        if progress_cb:
+            progress_cb(min(i + len(batch), _embed_total), _embed_total, batch[-1].get("name", ""))
 
     elapsed = (time.perf_counter() - start) * 1000
     result: dict = {

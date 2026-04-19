@@ -141,7 +141,7 @@ Each symbol receives a deterministic identifier derived from its repository, fil
 
 ## 5. Implementation Overview
 
-The implementation described here uses tree-sitter grammars for 25+ languages, a SQLite-backed symbol store, and BM25 for text search. The system runs as an MCP (Model Context Protocol) server, exposing tools that LLM agents call directly.
+The implementation described here uses tree-sitter grammars for 70+ languages, a SQLite-backed symbol store, and BM25 for text search. The system runs as an MCP (Model Context Protocol) server, exposing tools that LLM agents call directly.
 
 ### 5.1 Language Support
 
@@ -424,7 +424,7 @@ AST symbol retrieval is not a universal replacement for RAG:
 **AST retrieval fails when:**
 - The query intent maps to code spread across many small utility functions with generic names.
 - The symbol index is stale (file changed since last parse). Staleness detection mitigates this.
-- The language lacks a tree-sitter grammar. Coverage is broad (25+ languages) but not complete.
+- The language lacks a tree-sitter grammar. Coverage is broad (70+ languages) but not complete.
 
 **RAG fails when:**
 - The relevant code is smaller than the chunk size (over-retrieval).
@@ -474,7 +474,7 @@ The Model Context Protocol (MCP) provides a standardized interface for LLM tools
 
 ### 10.1 Language Coverage
 
-Tree-sitter grammars exist for ~40 languages, and the implementation tested here supports 25+. Languages without grammars (niche DSLs, proprietary languages) require custom extractors or fall back to file-level retrieval. Adding a new language requires mapping AST node types to symbol kinds --- typically a few hours of work, but non-trivial.
+Tree-sitter grammars exist for many languages, and the implementation tested here supports 70+ (with custom regex-based extractors for languages where tree-sitter grammars lack clean named fields). Languages without grammars (niche DSLs, proprietary languages) require custom extractors or fall back to file-level retrieval. Adding a new language requires mapping AST node types to symbol kinds --- typically a few hours of work, but non-trivial.
 
 ### 10.2 Indexing Overhead
 

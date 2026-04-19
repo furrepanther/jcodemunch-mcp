@@ -7,9 +7,11 @@ WAL mode enables concurrent readers + single writer with delta writes.
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +75,27 @@ CREATE TABLE IF NOT EXISTS files (
     imports    TEXT,
     size_bytes INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS branch_deltas (
+    branch    TEXT NOT NULL,
+    file      TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    symbol_data TEXT,
+    file_hash TEXT,
+    file_mtime_ns INTEGER,
+    file_language TEXT,
+    file_summary TEXT,
+    file_imports TEXT,
+    file_size_bytes INTEGER,
+    PRIMARY KEY (branch, file)
+);
+
+CREATE TABLE IF NOT EXISTS branch_meta (
+    branch     TEXT PRIMARY KEY,
+    git_head   TEXT,
+    indexed_at TEXT,
+    base_head  TEXT
+);
 """
 
 # Pragmas set on every connection open
@@ -122,14 +145,14 @@ class _CacheEntry(NamedTuple):
     code_index: "CodeIndex"
 
 
-_index_cache: OrderedDict[tuple[str, str], _CacheEntry] = OrderedDict()
+_index_cache: OrderedDict[tuple[str, str, str], _CacheEntry] = OrderedDict()
 _cache_lock = threading.Lock()
 _CACHE_MAX_SIZE = 32
 
 
-def _cache_get(owner: str, name: str, mtime_ns: int) -> Optional["CodeIndex"]:
+def _cache_get(owner: str, name: str, mtime_ns: int, branch: str = "") -> Optional["CodeIndex"]:
     """Return cached CodeIndex if fresh, else None."""
-    key = (owner, name)
+    key = (owner, name, branch)
     with _cache_lock:
         entry = _index_cache.get(key)
         if entry is not None and entry.mtime_ns == mtime_ns:
@@ -138,9 +161,9 @@ def _cache_get(owner: str, name: str, mtime_ns: int) -> Optional["CodeIndex"]:
     return None
 
 
-def _cache_put(owner: str, name: str, mtime_ns: int, code_index: "CodeIndex") -> None:
+def _cache_put(owner: str, name: str, mtime_ns: int, code_index: "CodeIndex", branch: str = "") -> None:
     """Store a CodeIndex in the cache, evicting LRU if full."""
-    key = (owner, name)
+    key = (owner, name, branch)
     with _cache_lock:
         _index_cache[key] = _CacheEntry(mtime_ns, code_index)
         _index_cache.move_to_end(key)
@@ -149,9 +172,11 @@ def _cache_put(owner: str, name: str, mtime_ns: int, code_index: "CodeIndex") ->
 
 
 def _cache_evict(owner: str, name: str) -> None:
-    """Remove a specific repo from cache."""
+    """Remove a specific repo from cache (all branches)."""
     with _cache_lock:
-        _index_cache.pop((owner, name), None)
+        keys_to_remove = [k for k in _index_cache if k[0] == owner and k[1] == name]
+        for k in keys_to_remove:
+            _index_cache.pop(k, None)
 
 
 def _db_mtime_ns(db_path: Path) -> int:
@@ -245,6 +270,77 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     logger.info("Migrated symbols table from v6 to v7 (added complexity columns)")
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Migrate a v7 database to v8: call_references stored in data column as JSON array."""
+    # v7 stored no call_references data; v8 needs it for AST-based call graphs.
+    # We cannot reconstruct call references from the v7 schema without re-parsing sources.
+    # Mark the index as requiring re-index for call graph features.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("index_version", "8"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("call_refs_missing", "1"),
+    )
+    logger.warning(
+        "Migrated v7→v8: call_references were not stored in v7. "
+        "Call graph features (get_call_hierarchy, get_impact_preview, etc.) "
+        "will use text heuristics. Run 'jcodemunch-mcp index-folder' to fully "
+        "re-index and enable AST-based call graphs."
+    )
+
+
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """Migrate a v8 database to v9: add branch_deltas and branch_meta tables."""
+    # Create branch tables if they don't exist (idempotent)
+    conn.executescript("""\
+        CREATE TABLE IF NOT EXISTS branch_deltas (
+            branch    TEXT NOT NULL,
+            file      TEXT NOT NULL,
+            action    TEXT NOT NULL,
+            symbol_data TEXT,
+            file_hash TEXT,
+            file_mtime_ns INTEGER,
+            file_language TEXT,
+            file_summary TEXT,
+            file_imports TEXT,
+            file_size_bytes INTEGER,
+            PRIMARY KEY (branch, file)
+        );
+        CREATE TABLE IF NOT EXISTS branch_meta (
+            branch     TEXT PRIMARY KEY,
+            git_head   TEXT,
+            indexed_at TEXT,
+            base_head  TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("index_version", "9"),
+    )
+    logger.info("Migrated v8→v9: added branch_deltas and branch_meta tables")
+
+
+def _unlink_retry(path: Path, retries: int = 3, delay: float = 0.1) -> bool:
+    """Delete a file with retry logic for Windows file-locking (PermissionError).
+
+    On Windows, WAL-mode SQLite files can remain briefly locked by another
+    thread even after all connections are closed.  Retrying with a short
+    sleep resolves this in practice without masking real permission errors
+    (which would persist across all retries and re-raise on the final attempt).
+    """
+    for attempt in range(retries):
+        try:
+            path.unlink()
+            return True
+        except PermissionError:
+            if platform.system() != "Windows" or attempt == retries - 1:
+                raise
+            time.sleep(delay)
+    return False  # unreachable, but satisfies type checkers
+
+
 class SQLiteIndexStore:
     """Storage backend using SQLite WAL for code indexes.
 
@@ -307,6 +403,10 @@ class SQLiteIndexStore:
                     _migrate_v5_to_v6(conn)
                 if stored_version < 7:
                     _migrate_v6_to_v7(conn)
+                if stored_version < 8:
+                    _migrate_v7_to_v8(conn)
+                if stored_version < 9:
+                    _migrate_v8_to_v9(conn)
 
             SQLiteIndexStore._initialized_dbs.add(db_key)
 
@@ -376,6 +476,345 @@ class SQLiteIndexStore:
         finally:
             conn.close()
 
+    # ── Branch delta API ─────────────────────────────────────────────
+
+    def save_branch_delta(
+        self,
+        owner: str,
+        name: str,
+        branch: str,
+        changed_files: list[str],
+        new_files: list[str],
+        deleted_files: list[str],
+        new_symbols: list["Symbol"],
+        raw_files: dict[str, str],
+        git_head: str = "",
+        base_head: str = "",
+        file_hashes: Optional[dict[str, str]] = None,
+        file_mtimes: Optional[dict[str, int]] = None,
+        file_languages: Optional[dict[str, str]] = None,
+        file_summaries: Optional[dict[str, str]] = None,
+        file_imports: Optional[dict[str, list[dict]]] = None,
+    ) -> None:
+        """Save a branch delta layer — records only what changed relative to the base index.
+
+        For each changed/new file: stores its symbols, hash, and metadata.
+        For each deleted file: stores a 'delete' marker.
+        """
+        db_path = self._db_path(owner, name)
+        if not db_path.exists():
+            return
+
+        file_sizes = {fp: len(content.encode("utf-8")) for fp, content in raw_files.items()}
+
+        conn = self._connect(db_path)
+        try:
+            conn.execute("BEGIN")
+
+            # Clear existing delta entries for files we're updating
+            all_affected = set(changed_files) | set(new_files) | set(deleted_files)
+            if all_affected:
+                placeholders = ",".join("?" * len(all_affected))
+                conn.execute(
+                    f"DELETE FROM branch_deltas WHERE branch = ? AND file IN ({placeholders})",
+                    (branch, *all_affected),
+                )
+
+            # Insert delta entries
+            rows = []
+            for fp in set(changed_files) | set(new_files):
+                # Gather symbols for this file
+                file_syms = [s for s in new_symbols if s.file == fp]
+                sym_data = json.dumps([self._symbol_to_dict_for_delta(s) for s in file_syms]) if file_syms else "[]"
+                rows.append((
+                    branch, fp, "modify" if fp in changed_files else "add",
+                    sym_data,
+                    (file_hashes or {}).get(fp, ""),
+                    (file_mtimes or {}).get(fp),
+                    (file_languages or {}).get(fp, ""),
+                    (file_summaries or {}).get(fp, ""),
+                    json.dumps((file_imports or {}).get(fp, [])),
+                    file_sizes.get(fp),
+                ))
+            for fp in deleted_files:
+                rows.append((branch, fp, "delete", None, None, None, None, None, None, None))
+
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO branch_deltas "
+                    "(branch, file, action, symbol_data, file_hash, file_mtime_ns, "
+                    "file_language, file_summary, file_imports, file_size_bytes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+
+            # Update branch_meta
+            conn.execute(
+                "INSERT OR REPLACE INTO branch_meta (branch, git_head, indexed_at, base_head) "
+                "VALUES (?, ?, ?, ?)",
+                (branch, git_head, datetime.now().isoformat(), base_head),
+            )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Write raw content files for branch delta
+        content_dir = self._content_dir(owner, name)
+        content_dir.mkdir(parents=True, exist_ok=True)
+        for file_path, content in raw_files.items():
+            file_dest = self._safe_content_path(content_dir, file_path)
+            if not file_dest:
+                raise ValueError(f"Unsafe file path in raw_files: {file_path}")
+            file_dest.parent.mkdir(parents=True, exist_ok=True)
+            self._write_cached_text(file_dest, content)
+
+        # Evict branch-specific cache entry
+        safe_name = self._safe_repo_component(name, "name")
+        _cache_evict(owner, safe_name)
+
+    def load_branch_delta(
+        self, owner: str, name: str, branch: str,
+    ) -> Optional[dict]:
+        """Load a branch delta from the database.
+
+        Returns a dict with keys: branch, git_head, base_head, indexed_at,
+        files (list of {file, action, symbols, hash, ...}).
+        Returns None if no delta exists for this branch.
+        """
+        db_path = self._db_path(owner, name)
+        if not db_path.exists():
+            return None
+
+        conn = self._connect(db_path)
+        try:
+            meta_row = conn.execute(
+                "SELECT * FROM branch_meta WHERE branch = ?", (branch,)
+            ).fetchone()
+            if meta_row is None:
+                return None
+
+            delta_rows = conn.execute(
+                "SELECT * FROM branch_deltas WHERE branch = ?", (branch,)
+            ).fetchall()
+
+            files = []
+            for r in delta_rows:
+                entry: dict = {
+                    "file": r["file"],
+                    "action": r["action"],
+                }
+                if r["symbol_data"]:
+                    try:
+                        entry["symbols"] = json.loads(r["symbol_data"])
+                    except (json.JSONDecodeError, ValueError):
+                        entry["symbols"] = []
+                if r["file_hash"]:
+                    entry["hash"] = r["file_hash"]
+                if r["file_mtime_ns"] is not None:
+                    entry["mtime_ns"] = r["file_mtime_ns"]
+                if r["file_language"]:
+                    entry["language"] = r["file_language"]
+                if r["file_summary"]:
+                    entry["summary"] = r["file_summary"]
+                if r["file_imports"]:
+                    try:
+                        entry["imports"] = json.loads(r["file_imports"])
+                    except (json.JSONDecodeError, ValueError):
+                        entry["imports"] = []
+                if r["file_size_bytes"] is not None:
+                    entry["size_bytes"] = r["file_size_bytes"]
+                files.append(entry)
+
+            return {
+                "branch": branch,
+                "git_head": meta_row["git_head"] or "",
+                "base_head": meta_row["base_head"] or "",
+                "indexed_at": meta_row["indexed_at"] or "",
+                "files": files,
+            }
+        finally:
+            conn.close()
+
+    def list_branches(self, owner: str, name: str) -> list[dict]:
+        """List all indexed branches for a repo.
+
+        Returns list of dicts with: branch, git_head, indexed_at, base_head, delta_file_count.
+        """
+        db_path = self._db_path(owner, name)
+        if not db_path.exists():
+            return []
+
+        conn = self._connect(db_path)
+        try:
+            meta_rows = conn.execute("SELECT * FROM branch_meta").fetchall()
+            result = []
+            for r in meta_rows:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM branch_deltas WHERE branch = ?",
+                    (r["branch"],),
+                ).fetchone()[0]
+                result.append({
+                    "branch": r["branch"],
+                    "git_head": r["git_head"] or "",
+                    "indexed_at": r["indexed_at"] or "",
+                    "base_head": r["base_head"] or "",
+                    "delta_file_count": count,
+                })
+            return result
+        finally:
+            conn.close()
+
+    def delete_branch_delta(self, owner: str, name: str, branch: str) -> bool:
+        """Delete a branch delta. Returns True if anything was deleted."""
+        db_path = self._db_path(owner, name)
+        if not db_path.exists():
+            return False
+
+        conn = self._connect(db_path)
+        try:
+            conn.execute("BEGIN")
+            r1 = conn.execute("DELETE FROM branch_deltas WHERE branch = ?", (branch,))
+            r2 = conn.execute("DELETE FROM branch_meta WHERE branch = ?", (branch,))
+            conn.commit()
+            deleted = (r1.rowcount or 0) + (r2.rowcount or 0) > 0
+        finally:
+            conn.close()
+
+        if deleted:
+            safe_name = self._safe_repo_component(name, "name")
+            _cache_evict(owner, safe_name)
+        return deleted
+
+    def compose_branch_index(
+        self, base_index: "CodeIndex", branch: str, delta: dict,
+    ) -> "CodeIndex":
+        """Compose a branch-aware CodeIndex by overlaying a delta on the base index.
+
+        Args:
+            base_index: The full base index (typically main/master).
+            branch: Branch name.
+            delta: Result from load_branch_delta().
+
+        Returns:
+            A new CodeIndex representing the repo state on the given branch.
+        """
+        from .index_store import CodeIndex
+
+        deleted_files: set[str] = set()
+        modified_files: set[str] = set()
+        added_files: set[str] = set()
+        delta_symbols_by_file: dict[str, list[dict]] = {}
+        delta_hashes: dict[str, str] = {}
+        delta_mtimes: dict[str, int] = {}
+        delta_languages: dict[str, str] = {}
+        delta_summaries: dict[str, str] = {}
+        delta_imports: dict[str, list[dict]] = {}
+        delta_sizes: dict[str, int] = {}
+
+        for entry in delta.get("files", []):
+            fp = entry["file"]
+            action = entry["action"]
+            if action == "delete":
+                deleted_files.add(fp)
+            elif action == "modify":
+                modified_files.add(fp)
+            elif action == "add":
+                added_files.add(fp)
+
+            if action in ("add", "modify"):
+                delta_symbols_by_file[fp] = entry.get("symbols", [])
+                if "hash" in entry:
+                    delta_hashes[fp] = entry["hash"]
+                if "mtime_ns" in entry:
+                    delta_mtimes[fp] = entry["mtime_ns"]
+                if "language" in entry:
+                    delta_languages[fp] = entry["language"]
+                if "summary" in entry:
+                    delta_summaries[fp] = entry["summary"]
+                if "imports" in entry:
+                    delta_imports[fp] = entry["imports"]
+                if "size_bytes" in entry:
+                    delta_sizes[fp] = entry["size_bytes"]
+
+        files_to_remove = deleted_files | modified_files
+
+        # Patch symbols: drop symbols from removed/modified files, add delta symbols
+        retained_syms = [s for s in base_index.symbols if s.get("file") not in files_to_remove]
+        new_syms = []
+        for fp, syms in delta_symbols_by_file.items():
+            new_syms.extend(syms)
+        composed_symbols = retained_syms + new_syms
+
+        # Patch source_files
+        kept_files = [f for f in base_index.source_files if f not in files_to_remove]
+        composed_source_files = sorted(set(kept_files) | modified_files | added_files)
+
+        # Patch file-level dicts
+        def _patch(base_d: dict, delta_d: dict, remove: set) -> dict:
+            result = {k: v for k, v in base_d.items() if k not in remove}
+            result.update(delta_d)
+            return result
+
+        composed_hashes = _patch(base_index.file_hashes, delta_hashes, files_to_remove)
+        composed_mtimes = _patch(base_index.file_mtimes, delta_mtimes, files_to_remove)
+        composed_languages = _patch(base_index.file_languages, delta_languages, files_to_remove)
+        composed_summaries = _patch(base_index.file_summaries, delta_summaries, files_to_remove)
+        composed_sizes = _patch(base_index.file_sizes, delta_sizes, files_to_remove)
+
+        base_imports = base_index.imports if base_index.imports is not None else {}
+        composed_imports = _patch(base_imports, delta_imports, files_to_remove)
+
+        # Recompute language counts
+        lang_counts: dict[str, int] = {}
+        for lang in composed_languages.values():
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+        return CodeIndex(
+            repo=base_index.repo,
+            owner=base_index.owner,
+            name=base_index.name,
+            indexed_at=delta.get("indexed_at", base_index.indexed_at),
+            source_files=composed_source_files,
+            languages=lang_counts,
+            symbols=composed_symbols,
+            index_version=base_index.index_version,
+            file_hashes=composed_hashes,
+            git_head=delta.get("git_head", base_index.git_head),
+            file_summaries=composed_summaries,
+            source_root=base_index.source_root,
+            file_languages=composed_languages,
+            display_name=base_index.display_name,
+            imports=composed_imports,
+            context_metadata=base_index.context_metadata,
+            file_blob_shas=base_index.file_blob_shas,
+            file_mtimes=composed_mtimes,
+            file_sizes=composed_sizes,
+            package_names=getattr(base_index, "package_names", []),
+            branch=branch,
+        )
+
+    def _symbol_to_dict_for_delta(self, symbol: "Symbol") -> dict:
+        """Convert a Symbol to a serializable dict for branch delta storage."""
+        return {
+            "id": symbol.id, "file": symbol.file, "name": symbol.name,
+            "kind": symbol.kind or "", "signature": symbol.signature or "",
+            "summary": symbol.summary or "", "docstring": symbol.docstring or "",
+            "qualified_name": symbol.qualified_name or symbol.name,
+            "language": symbol.language or "",
+            "decorators": symbol.decorators or [], "keywords": symbol.keywords or [],
+            "parent": symbol.parent, "line": symbol.line or 0,
+            "end_line": symbol.end_line or 0,
+            "byte_offset": symbol.byte_offset or 0,
+            "byte_length": symbol.byte_length or 0,
+            "content_hash": symbol.content_hash or "",
+            "ecosystem_context": getattr(symbol, "ecosystem_context", "") or "",
+            "cyclomatic": getattr(symbol, "cyclomatic", 0) or 0,
+            "max_nesting": getattr(symbol, "max_nesting", 0) or 0,
+            "param_count": getattr(symbol, "param_count", 0) or 0,
+            "call_references": getattr(symbol, "call_references", []) or [],
+        }
+
     # ── Public API (mirrors IndexStore) ─────────────────────────────
 
     def save_index(
@@ -417,7 +856,8 @@ class SQLiteIndexStore:
              "byte_length": s.byte_length, "content_hash": s.content_hash,
              "cyclomatic": getattr(s, "cyclomatic", 0) or 0,
              "max_nesting": getattr(s, "max_nesting", 0) or 0,
-             "param_count": getattr(s, "param_count", 0) or 0}
+             "param_count": getattr(s, "param_count", 0) or 0,
+             "call_references": getattr(s, "call_references", []) or []}
             for s in symbols
         ]
 
@@ -517,8 +957,13 @@ class SQLiteIndexStore:
         _cache_put(owner, safe_name, _db_mtime_ns(db_path), index)
         return index
 
-    def load_index(self, owner: str, name: str) -> Optional["CodeIndex"]:
-        """Load index from SQLite, constructing a CodeIndex dataclass."""
+    def load_index(self, owner: str, name: str, branch: str = "") -> Optional["CodeIndex"]:
+        """Load index from SQLite, constructing a CodeIndex dataclass.
+
+        When branch is non-empty and a branch delta exists, the base index
+        is composed with the delta to produce a branch-specific view.
+        When branch is empty, loads the base index as before.
+        """
         _ensure_index_store_deps()
         # Sanitize name so "my project (v2)" maps to the same .db as save_index
         safe_name = self._safe_repo_component(name, "name")
@@ -528,7 +973,7 @@ class SQLiteIndexStore:
 
         # Check in-memory cache (mirrors old @lru_cache on JSON load).
         # Stat only when the key is present — avoids a syscall on cold starts.
-        key = (owner, safe_name)
+        key = (owner, safe_name, branch)
         with _cache_lock:
             _has_key = key in _index_cache
         if _has_key:
@@ -536,7 +981,7 @@ class SQLiteIndexStore:
                 mtime_ns = _db_mtime_ns(db_path)
             except OSError:
                 return None  # file was deleted between exists() and stat()
-            cached = _cache_get(owner, safe_name, mtime_ns)
+            cached = _cache_get(owner, safe_name, mtime_ns, branch)
             if cached is not None:
                 return cached
 
@@ -555,15 +1000,39 @@ class SQLiteIndexStore:
             file_rows = conn.execute("SELECT * FROM files").fetchall()
 
             index = self._build_index_from_rows(meta, symbol_rows, file_rows, owner, name)
+
+            # Warn if call references were not migrated (v7→v8 case)
+            if meta.get("call_refs_missing") == "1":
+                logger.warning(
+                    "Index %s/%s was migrated from v7 which did not store call references. "
+                    "get_call_hierarchy and get_impact_preview will use text heuristics. "
+                    "Run 'jcodemunch-mcp index-folder' to re-index for AST-based call graphs.",
+                    owner, name,
+                )
         finally:
             conn.close()
+
+        # If a branch is requested, compose the delta on top of the base
+        if branch:
+            delta = self.load_branch_delta(owner, name, branch)
+            if delta is not None:
+                # Check if delta is stale (base has been re-indexed since delta was created)
+                if delta.get("base_head") and delta["base_head"] != index.git_head:
+                    logger.warning(
+                        "Branch delta for '%s' on %s/%s is stale "
+                        "(base_head %s != current %s). Delta will be applied but may be inaccurate. "
+                        "Re-run index_folder on the branch to refresh.",
+                        branch, owner, name,
+                        delta["base_head"][:8], (index.git_head or "")[:8],
+                    )
+                index = self.compose_branch_index(index, branch, delta)
 
         # Populate cache (re-stat to capture any WAL checkpoint mtime change)
         try:
             post_mtime_ns = _db_mtime_ns(db_path)
         except OSError:
-            post_mtime_ns = mtime_ns  # file gone; cache with pre-load mtime
-        _cache_put(owner, safe_name, post_mtime_ns, index)
+            post_mtime_ns = 0
+        _cache_put(owner, safe_name, post_mtime_ns, index, branch)
         return index
 
     def has_index(self, owner: str, name: str) -> bool:
@@ -901,6 +1370,30 @@ class SQLiteIndexStore:
 
         return changed_files, new_files, deleted_files
 
+    def get_source_root(self, owner: str, name: str) -> Optional[str]:
+        """Fast metadata-only query for source_root.
+
+        Returns None if the repo is not indexed.
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return None
+        _pairs = parse_path_map()
+        try:
+            conn = self._connect(db_path)
+            try:
+                meta = self._read_meta(conn)
+            finally:
+                conn.close()
+            if not meta:
+                return None
+            return remap(meta.get("source_root", ""), _pairs)
+        except Exception:
+            logger.debug("Failed to get source_root for %s/%s", owner, name, exc_info=True)
+            return None
+
     def list_repos(self) -> list[dict]:
         """List all indexed repositories (scans .db files only)."""
         _pairs = parse_path_map()
@@ -924,13 +1417,32 @@ class SQLiteIndexStore:
             meta = self._read_meta(conn)
             symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
             file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            # Read branch info if branch tables exist
+            branches = []
+            try:
+                branch_rows = conn.execute(
+                    "SELECT branch, git_head, indexed_at, base_head FROM branch_meta"
+                ).fetchall()
+                for r in branch_rows:
+                    delta_count = conn.execute(
+                        "SELECT COUNT(*) FROM branch_deltas WHERE branch = ?",
+                        (r["branch"],),
+                    ).fetchone()[0]
+                    branches.append({
+                        "branch": r["branch"],
+                        "git_head": r["git_head"] or "",
+                        "indexed_at": r["indexed_at"] or "",
+                        "delta_file_count": delta_count,
+                    })
+            except Exception:
+                pass  # branch tables may not exist on pre-v9 DBs
         finally:
             conn.close()
 
         if not meta:
             return None
         languages = json.loads(meta.get("languages", "{}"))
-        return {
+        entry = {
             "repo": meta.get("repo", ""),
             "indexed_at": meta.get("indexed_at", ""),
             "symbol_count": symbol_count,
@@ -941,6 +1453,9 @@ class SQLiteIndexStore:
             "display_name": meta.get("display_name", ""),
             "source_root": remap(meta.get("source_root", ""), _pairs),
         }
+        if branches:
+            entry["branches"] = branches
+        return entry
 
     def delete_index(self, owner: str, name: str) -> bool:
         """Delete a repo's .db, .db-wal, .db-shm, and content dir."""
@@ -950,18 +1465,18 @@ class SQLiteIndexStore:
         deleted = False
 
         if db_path.exists():
-            db_path.unlink()
+            _unlink_retry(db_path)
             deleted = True
             SQLiteIndexStore._initialized_dbs.discard(str(db_path))
 
         wal_path = Path(str(db_path) + "-wal")
         if wal_path.exists():
-            wal_path.unlink()
+            _unlink_retry(wal_path)
             deleted = True
 
         shm_path = Path(str(db_path) + "-shm")
         if shm_path.exists():
-            shm_path.unlink()
+            _unlink_retry(shm_path)
             deleted = True
 
         content_dir = self._content_dir(owner, name)
@@ -969,6 +1484,37 @@ class SQLiteIndexStore:
             shutil.rmtree(content_dir)
             deleted = True
 
+        return deleted
+
+    def cleanup_orphan_indexes(self) -> int:
+        """Delete indexes whose source_root no longer exists on disk.
+
+        Remote repos (GitHub, empty source_root) are skipped.
+        Returns the number of orphan indexes deleted.
+        """
+        deleted = 0
+        for entry in self.list_repos():
+            source_root = entry.get("source_root", "")
+            if not source_root:
+                continue  # Remote repo — no filesystem path to validate
+            try:
+                if not Path(source_root).is_dir():
+                    repo_id = entry["repo"]
+                    # repo_id is "local/name-hash" or "github/owner/repo"
+                    parts = repo_id.split("/", 1)
+                    if len(parts) == 2:
+                        owner, name = parts
+                    else:
+                        continue  # Malformed — skip
+                    if self.delete_index(owner, name):
+                        deleted += 1
+                        logger.info(
+                            "Deleted orphan index: %s (source_root: %s)",
+                            repo_id,
+                            source_root,
+                        )
+            except Exception:
+                logger.debug("Orphan check failed for %s", source_root, exc_info=True)
         return deleted
 
     def get_symbol_content(
@@ -1054,7 +1600,8 @@ class SQLiteIndexStore:
     # ── Internal helpers ────────────────────────────────────────────
 
     def _symbol_to_row(self, symbol: Symbol) -> tuple:
-        """Convert a Symbol to a row tuple for INSERT (v7 schema)."""
+        """Convert a Symbol to a row tuple for INSERT (v8 schema)."""
+        call_refs = getattr(symbol, "call_references", []) or []
         return (
             symbol.id, symbol.file, symbol.name, symbol.kind,
             symbol.signature, symbol.summary, symbol.docstring,
@@ -1067,16 +1614,17 @@ class SQLiteIndexStore:
             json.dumps(symbol.keywords) if symbol.keywords else "[]",
             symbol.content_hash,
             getattr(symbol, "ecosystem_context", ""),
-            None,  # data column — no longer used in v5
+            json.dumps(call_refs) if call_refs else None,  # data column — v8: call_references as JSON array
             getattr(symbol, "cyclomatic", 0) or None,
             getattr(symbol, "max_nesting", 0) or None,
             getattr(symbol, "param_count", 0) or None,
         )
 
     def _symbol_dict_to_row(self, d: dict) -> tuple:
-        """Convert a serialized symbol dict to a row tuple for INSERT (v7 schema)."""
+        """Convert a serialized symbol dict to a row tuple for INSERT (v8 schema)."""
         decorators = d.get("decorators", [])
         keywords = d.get("keywords", [])
+        call_refs = d.get("call_references", [])
         return (
             d["id"], d["file"], d["name"], d.get("kind", ""),
             d.get("signature", ""), d.get("summary", ""), d.get("docstring", ""),
@@ -1089,7 +1637,7 @@ class SQLiteIndexStore:
             json.dumps(keywords) if keywords else "[]",
             d.get("content_hash", ""),
             d.get("ecosystem_context", ""),
-            None,  # data column — no longer used in v5
+            json.dumps(call_refs) if call_refs else None,  # data column — v8: call_references as JSON array
             d.get("cyclomatic") or None,
             d.get("max_nesting") or None,
             d.get("param_count") or None,
@@ -1097,14 +1645,19 @@ class SQLiteIndexStore:
 
     def _row_to_symbol_dict(self, row: sqlite3.Row) -> dict:
         """Convert a database row to a symbol dict (matches CodeIndex.symbols format)."""
+        call_references: list[str] = []
         # v5: read directly from columns. Fallback to data JSON for mid-migration rows.
         if row["data"]:
-            # Legacy v4 row (data not yet migrated) — parse JSON
             try:
                 data = json.loads(row["data"])
             except (json.JSONDecodeError, ValueError):
                 logger.warning("Corrupted JSON in symbol data column for row %s, skipping legacy fields", row["name"])
                 data = {}
+            if isinstance(data, list):
+                # v8: data column contains call_references as JSON array
+                call_references = data
+                data = {}
+            # else: legacy v4 row (data is a JSON object)
             qualified_name = data.get("qualified_name", row["name"])
             language = data.get("language", "")
             decorators = data.get("decorators", [])
@@ -1112,7 +1665,7 @@ class SQLiteIndexStore:
             content_hash = data.get("content_hash", "")
             ecosystem_context = data.get("ecosystem_context", "")
         else:
-            # v5 row — direct column reads, no JSON parsing
+            # v5/v6/v7 row — direct column reads, no JSON parsing
             qualified_name = row["qualified_name"] or row["name"]
             language = row["language"] or ""
             deco_raw = row["decorators"]
@@ -1151,6 +1704,7 @@ class SQLiteIndexStore:
             "cyclomatic": row["cyclomatic"] or 0,
             "max_nesting": row["max_nesting"] or 0,
             "param_count": row["param_count"] or 0,
+            "call_references": call_references,
         }
 
     def _symbol_to_dict(self, symbol: "Symbol") -> dict:
@@ -1181,6 +1735,7 @@ class SQLiteIndexStore:
             "cyclomatic": getattr(symbol, "cyclomatic", 0) or 0,
             "max_nesting": getattr(symbol, "max_nesting", 0) or 0,
             "param_count": getattr(symbol, "param_count", 0) or 0,
+            "call_references": getattr(symbol, "call_references", []) or [],
         }
 
     def _patch_index_from_delta(
@@ -1383,6 +1938,7 @@ class SQLiteIndexStore:
             "languages": json.dumps(index.languages),
             "context_metadata": json.dumps(index.context_metadata or {}),
             "package_names": json.dumps(getattr(index, "package_names", []) or []),
+            "base_branch": getattr(index, "branch", "") or "",
         }
         conn.executemany(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
@@ -1418,7 +1974,10 @@ class SQLiteIndexStore:
                 ".py": "python", ".js": "javascript", ".ts": "typescript",
                 ".jsx": "javascript", ".tsx": "typescript", ".go": "go",
                 ".rs": "rust", ".java": "java", ".c": "c", ".cpp": "cpp",
-                ".h": "cpp", ".cs": "csharp", ".swift": "swift",
+                ".h": "cpp", ".ino": "arduino", ".pde": "arduino",
+                ".vhd": "vhdl", ".vhdl": "vhdl",
+                ".v": "verilog", ".sv": "verilog",
+                ".cs": "csharp", ".swift": "swift",
                 ".rb": "ruby", ".php": "php", ".dart": "dart",
                 ".kt": "kotlin", ".scala": "scala", ".lua": "lua",
                 ".r": "r", ".m": "objective-c", ".mm": "objective-cpp",

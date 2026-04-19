@@ -115,47 +115,47 @@ def get_hotspots(
             file_churn = _get_file_churn(index.source_root, days)
 
     # Normalise file paths: git outputs forward-slash paths; index may use either
-    file_churn_norm = {k.replace("\\", "/"): v for k, v in file_churn.items()}
+        file_churn_norm = {k.replace("\\", "/"): v for k, v in file_churn.items()}
 
-    candidates: list[dict] = []
-    for sym in index.symbols:
-        if sym.get("kind") not in ("function", "method"):
-            continue
-        cyclomatic = sym.get("cyclomatic") or 0
-        if cyclomatic < min_complexity:
-            continue
+        candidates: list[dict] = []
+        for sym in index.symbols:
+            if sym.get("kind") not in ("function", "method"):
+                continue
+            cyclomatic = sym.get("cyclomatic") or 0
+            if cyclomatic < min_complexity:
+                continue
 
-        file_path = sym.get("file", "")
-        file_norm = file_path.replace("\\", "/")
-        churn = file_churn_norm.get(file_norm, 0)
+            file_path = sym.get("file", "")
+            file_norm = file_path.replace("\\", "/")
+            churn = file_churn_norm.get(file_norm, 0)
 
-        hotspot_score = round(cyclomatic * math.log1p(churn), 4)
+            hotspot_score = round(cyclomatic * math.log1p(churn), 4)
 
-        if hotspot_score > 10:
-            assessment = "high"
-        elif hotspot_score > 3:
-            assessment = "medium"
-        else:
-            assessment = "low"
+            if hotspot_score > 10:
+                assessment = "high"
+            elif hotspot_score > 3:
+                assessment = "medium"
+            else:
+                assessment = "low"
 
-        candidates.append({
-            "symbol_id": sym.get("id", ""),
-            "name": sym.get("name", ""),
-            "kind": sym.get("kind", ""),
-            "file": file_path,
-            "line": sym.get("line") or 0,
-            "cyclomatic": cyclomatic,
-            "max_nesting": sym.get("max_nesting") or 0,
-            "param_count": sym.get("param_count") or 0,
-            "churn": churn,
-            "hotspot_score": hotspot_score,
-            "assessment": assessment,
-        })
+            candidates.append({
+                "symbol_id": sym.get("id", ""),
+                "name": sym.get("name", ""),
+                "kind": sym.get("kind", ""),
+                "file": file_path,
+                "line": sym.get("line") or 0,
+                "cyclomatic": cyclomatic,
+                "max_nesting": sym.get("max_nesting") or 0,
+                "param_count": sym.get("param_count") or 0,
+                "churn": churn,
+                "hotspot_score": hotspot_score,
+                "assessment": assessment,
+            })
 
-    candidates.sort(key=lambda x: -x["hotspot_score"])
-    top = candidates[:max(1, top_n)]
+        candidates.sort(key=lambda x: -x["hotspot_score"])
+        top = candidates[:max(1, top_n)]
 
-    has_complexity_data = any(c["cyclomatic"] > 0 for c in candidates)
+    has_complexity_data = any(c.get("cyclomatic", 0) > 0 for c in top)
     note = None
     if not has_complexity_data:
         note = (

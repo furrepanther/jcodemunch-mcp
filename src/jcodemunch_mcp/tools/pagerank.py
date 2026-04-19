@@ -2,7 +2,6 @@
 
 from typing import Optional
 
-
 def compute_pagerank(
     imports: dict,
     source_files: list,
@@ -27,10 +26,8 @@ def compute_pagerank(
     if n == 0:
         return {}, 0
 
-    # Build directed adjacency lists from import graph
-    out_links: dict = {f: [] for f in source_files}
-    in_links: dict = {f: [] for f in source_files}
-
+    # Resolve import specifiers to directed edges
+    edges: list[tuple[str, str]] = []
     for src_file, file_imports in (imports or {}).items():
         if src_file not in source_file_set:
             continue
@@ -39,8 +36,14 @@ def compute_pagerank(
             target = resolve_specifier(imp["specifier"], src_file, source_file_set, alias_map, psr4_map)
             if target and target != src_file and target in source_file_set and target not in seen:
                 seen.add(target)
-                out_links[src_file].append(target)
-                in_links[target].append(src_file)
+                edges.append((src_file, target))
+
+    # Build adjacency from resolved edges
+    out_links: dict = {f: [] for f in source_files}
+    in_links: dict = {f: [] for f in source_files}
+    for src_file, target in edges:
+        out_links[src_file].append(target)
+        in_links[target].append(src_file)
 
     # Initialize uniform distribution
     scores: dict = {f: 1.0 / n for f in source_files}

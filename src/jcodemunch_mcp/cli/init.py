@@ -3,6 +3,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -19,13 +20,15 @@ _CLAUDE_MD_POLICY = """\
 ## Code Exploration Policy
 
 Always use jCodemunch-MCP tools for code navigation. Never fall back to Read, Grep, Glob, or Bash for code exploration.
+**Exception:** Use `Read` when you need to edit a file — the agent harness requires a `Read` before `Edit`/`Write` will succeed. Use jCodemunch tools to *find and understand* code, then `Read` only the specific file you're about to modify.
 
 **Start any session:**
 1. `resolve_repo { "path": "." }` — confirm the project is indexed. If not: `index_folder { "path": "." }`
 2. `suggest_queries` — when the repo is unfamiliar
 
 **Finding code:**
-- symbol by name → `search_symbols` (add `kind=`, `language=`, `file_pattern=` to narrow)
+- symbol by name → `search_symbols` (add `kind=`, `language=`, `file_pattern=`, `decorator=` to narrow)
+- decorator-aware queries → `search_symbols(decorator="X")` to find symbols with a specific decorator (e.g. `@property`, `@route`); combine with set-difference to find symbols *lacking* a decorator (e.g. "which endpoints lack CSRF protection?")
 - string, comment, config value → `search_text` (supports regex, `context_lines`)
 - database columns (dbt/SQLMesh) → `search_columns`
 
@@ -49,7 +52,44 @@ Always use jCodemunch-MCP tools for code navigation. Never fall back to Read, Gr
 - find unreachable/dead code → `find_dead_code`
 - class hierarchy → `get_class_hierarchy`
 
-**After editing a file:** `index_file { "path": "/abs/path/to/file" }` to keep the index fresh.
+## Session-Aware Routing
+
+**Opening move for any task:**
+1. `plan_turn { "repo": "...", "query": "your task description", "model": "<your-model-id>" }` — get confidence + recommended files; the `model` parameter narrows the exposed tool list to match your capabilities at zero extra requests.
+2. Obey the confidence level:
+   - `high` → go directly to recommended symbols, max 2 supplementary reads
+   - `medium` → explore recommended files, max 5 supplementary reads
+   - `low` → the feature likely doesn't exist. Report the gap to the user. Do NOT search further hoping to find it.
+
+**Interpreting search results:**
+- If `search_symbols` returns `negative_evidence` with `verdict: "no_implementation_found"`:
+  - Do NOT re-search with different terms hoping to find it
+  - Do NOT assume a related file (e.g. auth middleware) implements the missing feature (e.g. CSRF)
+  - DO report: "No existing implementation found for X. This would need to be created."
+  - DO check `related_existing` files — they show what's nearby, not what exists
+- If `verdict: "low_confidence_matches"`: examine the matches critically before assuming they implement the feature
+
+**After editing files:**
+- If PostToolUse hooks are installed (Claude Code only), edited files are auto-reindexed
+- Otherwise, call `register_edit` with edited file paths to invalidate caches and keep the index fresh
+- For bulk edits (5+ files), always use `register_edit` with all paths to batch-invalidate
+
+**Token efficiency:**
+- If `_meta` contains `budget_warning`: stop exploring and work with what you have
+- If `auto_compacted: true` appears: results were automatically compressed due to turn budget
+- Use `get_session_context` to check what you've already read — avoid re-reading the same files
+
+## Model-Driven Tool Tiering
+
+Your jcodemunch-mcp server narrows the exposed tool list based on the model you are running as. To avoid wasting requests on primitives when a composite would do, always include `model="<your-model-id>"` in your opening `plan_turn` call.
+
+Replace `<your-model-id>` with your active model:
+- Claude Opus variants → `claude-opus-4-7` (or any `claude-opus-*`)
+- Claude Sonnet variants → `claude-sonnet-4-6`
+- Claude Haiku variants → `claude-haiku-4-5`
+- GPT-4o / GPT-5 / o1 / Llama → use the model id as printed by your runner
+
+The `model=` parameter rides on the existing `plan_turn` call — it does **not** add a separate tool invocation. If `plan_turn` is not appropriate for a non-code task, call `announce_model(model="...")` once instead.
 """
 
 _MCP_ENTRY = {
@@ -76,6 +116,18 @@ _ENFORCEMENT_HOOKS = {
     "PostToolUse": [{
         "matcher": "Edit|Write",
         "hooks": [{"type": "command", "command": "jcodemunch-mcp hook-posttooluse"}],
+    }],
+    "PreCompact": [{
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "jcodemunch-mcp hook-precompact"}],
+    }],
+    "TaskCompleted": [{
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "jcodemunch-mcp hook-taskcomplete"}],
+    }],
+    "SubagentStart": [{
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "jcodemunch-mcp hook-subagent-start"}],
     }],
 }
 
@@ -259,11 +311,111 @@ def _has_policy(path: Path) -> bool:
     return _CLAUDE_MD_MARKER in path.read_text(encoding="utf-8")
 
 
+def _get_active_tools() -> set[str] | None:
+    """Return the set of tool names active under current config.
+
+    Applies tool_profile and disabled_tools filtering.
+    Returns ``None`` when the profile is "full" and nothing is disabled
+    (i.e. no filtering needed).
+    """
+    try:
+        from ..config import get as cfg_get
+        from ..server import _PROFILE_TIERS, _CANONICAL_TOOL_NAMES
+    except Exception:
+        return None
+
+    profile = cfg_get("tool_profile", "full")
+    tier = _PROFILE_TIERS.get(profile)
+    disabled = set(cfg_get("disabled_tools", []))
+
+    if tier is None and not disabled:
+        return None  # full profile, nothing disabled
+
+    active = set(_CANONICAL_TOOL_NAMES) if tier is None else set(tier)
+    active -= disabled
+    return active
+
+
+# Regex matching tool names in backtick contexts:
+#  - `tool_name` (exact)
+#  - `tool_name { ... }` (tool with inline args)
+#  - `tool_name(...)` (tool with call syntax)
+_TOOL_REF_RE = re.compile(r"`([a-z][a-z0-9_]*)[`(\s{]")
+
+
+def _filter_policy_for_tools(policy: str, active_tools: set[str] | None) -> str:
+    """Filter the CLAUDE.md policy to only reference available tools.
+
+    Lines containing backtick-quoted tool names that are NOT in
+    *active_tools* are removed.  Sections left empty after filtering
+    are also removed.  Returns the policy unchanged when *active_tools*
+    is ``None`` (full profile, nothing disabled).
+    """
+    if active_tools is None:
+        return policy
+
+    # Build the set of all known tool names for reference-detection.
+    try:
+        from ..server import _CANONICAL_TOOL_NAMES
+        all_tools = set(_CANONICAL_TOOL_NAMES)
+    except Exception:
+        return policy
+
+    lines = policy.splitlines(keepends=True)
+    kept: list[str] = []
+
+    for line in lines:
+        refs = _TOOL_REF_RE.findall(line)
+        # Only consider refs that are actual tool names
+        tool_refs = [r for r in refs if r in all_tools]
+        if tool_refs and any(t not in active_tools for t in tool_refs):
+            continue  # drop line — references unavailable tool(s)
+        kept.append(line)
+
+    # Remove bold-label headers (e.g. "**Finding code:**") that lost all
+    # their child bullets.  A bold-label is "empty" if the next non-blank
+    # line is another bold-label, a ## heading, or EOF.
+    # We do NOT prune ## headings here — they may legitimately sit above
+    # bold-label sub-sections that survived filtering.
+    result: list[str] = []
+    i = 0
+    while i < len(kept):
+        line = kept[i]
+        stripped = line.strip()
+
+        is_bold_label = (
+            stripped.startswith("**")
+            and stripped.endswith(":**")
+            and not stripped.startswith("## ")
+        )
+
+        if is_bold_label:
+            j = i + 1
+            while j < len(kept) and not kept[j].strip():
+                j += 1
+            if j >= len(kept):
+                break  # trailing empty label — drop
+            next_s = kept[j].strip()
+            next_is_boundary = (
+                (next_s.startswith("**") and next_s.endswith(":**"))
+                or next_s.startswith("## ")
+            )
+            if next_is_boundary:
+                i = j  # skip empty bold-label section
+                continue
+
+        result.append(line)
+        i += 1
+
+    return "".join(result)
+
+
 def install_claude_md(scope: str = "global", *, dry_run: bool = False, backup: bool = True) -> str:
     """Append the Code Exploration Policy to CLAUDE.md.
 
     scope: "global" or "project"
     Returns a status message.
+    Respects ``tool_profile`` and ``disabled_tools`` from config.
     """
     path = _claude_md_path(scope)
     if _has_policy(path):
@@ -275,10 +427,11 @@ def install_claude_md(scope: str = "global", *, dry_run: bool = False, backup: b
     if backup and path.exists():
         shutil.copy2(path, path.with_suffix(".md.bak"))
 
+    policy = _filter_policy_for_tools(_CLAUDE_MD_POLICY, _get_active_tools())
     with open(path, "a", encoding="utf-8") as f:
         if path.exists() and path.stat().st_size > 0:
             f.write("\n\n")
-        f.write(_CLAUDE_MD_POLICY)
+        f.write(policy)
 
     return f"  appended policy to {path}"
 
@@ -307,7 +460,18 @@ def install_cursor_rules(*, dry_run: bool = False, backup: bool = True) -> str:
     if backup and path.exists():
         shutil.copy2(path, path.with_suffix(".mdc.bak"))
 
-    path.write_text(_CURSOR_RULES_CONTENT, encoding="utf-8")
+    active = _get_active_tools()
+    content = _CURSOR_RULES_CONTENT
+    if active is not None:
+        # Rebuild with filtered policy (preserve MDC frontmatter)
+        filtered = _filter_policy_for_tools(_CLAUDE_MD_POLICY, active)
+        content = (
+            "---\n"
+            "description: Use jCodemunch MCP tools for all code navigation instead of built-in search\n"
+            "alwaysApply: true\n"
+            "---\n\n"
+        ) + filtered
+    path.write_text(content, encoding="utf-8")
     return f"  wrote {path}"
 
 
@@ -334,12 +498,44 @@ def install_windsurf_rules(*, dry_run: bool = False, backup: bool = True) -> str
     if backup and path.exists():
         shutil.copy2(path, path.with_suffix(".windsurfrules.bak"))
 
+    policy = _filter_policy_for_tools(_CLAUDE_MD_POLICY, _get_active_tools())
     with open(path, "a", encoding="utf-8") as f:
         if path.exists() and path.stat().st_size > 0:
             f.write("\n\n")
-        f.write(_WINDSURF_RULES_CONTENT)
+        f.write(policy)
 
     return f"  appended policy to {path}"
+
+
+# ---------------------------------------------------------------------------
+# AGENTS.md (OpenCode, Codex, etc.)
+# ---------------------------------------------------------------------------
+
+def install_agents_md(*, dry_run: bool = False, backup: bool = True) -> str:
+    """Write ./AGENTS.md with the plan_turn(model=...) directive.
+
+    OpenCode, Codex, and several other agent runners read AGENTS.md as
+    their per-project system-prompt augmentation. Mirrors CLAUDE.md
+    policy so agents swapped via those runners observe the same
+    tier-switching convention.
+    """
+    target = Path.cwd() / "AGENTS.md"
+    policy = _filter_policy_for_tools(_CLAUDE_MD_POLICY, _get_active_tools())
+    if target.exists():
+        existing = target.read_text(encoding="utf-8")
+        if _CLAUDE_MD_MARKER in existing:
+            return f"  already present in {target}"
+        if dry_run:
+            return f"  would append policy to {target}"
+        if backup:
+            shutil.copy2(target, target.with_suffix(".md.bak"))
+        target.write_text(existing.rstrip() + "\n\n" + policy + "\n", encoding="utf-8")
+    else:
+        if dry_run:
+            return f"  would create {target}"
+        target.write_text(policy + "\n", encoding="utf-8")
+
+    return f"  wrote {target}"
 
 
 # ---------------------------------------------------------------------------
@@ -362,28 +558,45 @@ def _merge_hooks(
 
     ``marker`` is a substring used to detect whether our hook is already
     installed (e.g. ``"jcodemunch-mcp hook-event"``).
+
+    Each rule is checked individually: if a rule's command already exists
+    in the event's hook list, it is skipped.  This allows multiple rules
+    for the same event to be added incrementally.
     """
     hooks = data.setdefault("hooks", {})
     added: list[str] = []
 
     for event_name, event_hooks in hook_defs.items():
+        existing_cmds: set[str] = set()
         if event_name in hooks:
-            existing_cmds: list[str] = []
             for rule in hooks[event_name]:
                 for h in rule.get("hooks", []):
-                    existing_cmds.append(h.get("command", ""))
-            if any(marker in c for c in existing_cmds):
+                    existing_cmds.add(h.get("command", ""))
+
+        new_rules = []
+        for rule in event_hooks:
+            rule_cmds = [h.get("command", "") for h in rule.get("hooks", [])]
+            # Skip if this specific rule's command is already installed.
+            if any(cmd in existing_cmds for cmd in rule_cmds if cmd):
                 continue
-            hooks[event_name].extend(event_hooks)
-        else:
-            hooks[event_name] = list(event_hooks)
-        added.append(event_name)
+            # Fallback: check against the broad marker for legacy detection.
+            if any(marker in cmd for cmd in existing_cmds):
+                if any(marker in cmd for cmd in rule_cmds):
+                    continue
+            new_rules.append(rule)
+
+        if new_rules:
+            if event_name in hooks:
+                hooks[event_name].extend(new_rules)
+            else:
+                hooks[event_name] = new_rules
+            added.append(event_name)
 
     return added
 
 
 def install_hooks(*, dry_run: bool = False, backup: bool = True) -> str:
-    """Merge worktree hooks into ~/.claude/settings.json.
+    """Merge worktree and tool hooks into ~/.claude/settings.json.
 
     Returns a status message.
     """
@@ -410,7 +623,7 @@ def install_enforcement_hooks(*, dry_run: bool = False, backup: bool = True) -> 
     """
     path = _settings_json_path()
     data = _read_json(path)
-    added = _merge_hooks(data, _ENFORCEMENT_HOOKS, "jcodemunch-mcp hook-p")  # matches hook-pretooluse & hook-posttooluse
+    added = _merge_hooks(data, _ENFORCEMENT_HOOKS, "jcodemunch-mcp hook-p")  # matches hook-pretooluse & hook-posttooluse & hook-precompact
 
     if not added:
         return f"  enforcement hooks already present in {path}"
@@ -433,7 +646,7 @@ def run_index(*, dry_run: bool = False) -> str:
 
     try:
         from ..tools.index_folder import index_folder
-        result = index_folder(folder_path=cwd)
+        result = index_folder(path=cwd)
         files = result.get("files_indexed", "?")
         symbols = result.get("symbols_indexed", "?")
         return f"  indexed {cwd} ({files} files, {symbols} symbols)"
@@ -660,6 +873,22 @@ def run_init(
                     "Append Code Exploration Policy to .windsurfrules",
                     "Windsurf Cascade would prefer jCodemunch tools over built-in search on every turn",
                 ))
+
+    # 2d: AGENTS.md (OpenCode, Codex, etc.)
+    do_agents_md = yes or not interactive
+    if interactive:
+        print()
+        do_agents_md = _prompt_yn(
+            "Install AGENTS.md (OpenCode/Codex policy)?",
+        )
+    if do_agents_md:
+        msg = install_agents_md(dry_run=dry_run, backup=backup)
+        print(f"  AGENTS.md:{msg}")
+        if demo and "would" in msg:
+            _demo_actions.append((
+                "Create AGENTS.md with Code Exploration Policy",
+                "OpenCode, Codex, and other AGENTS.md-reading agents would prefer jCodemunch tools over built-in search",
+            ))
 
     # ----- Step 3: Agent hooks -----
     do_hooks = hooks

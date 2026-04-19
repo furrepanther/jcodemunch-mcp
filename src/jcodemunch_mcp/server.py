@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import atexit
 import functools
 import hmac
 import json
@@ -26,12 +27,17 @@ from .summarizer import get_provider_name
 from .reindex_state import await_freshness_if_strict
 from .path_map import ENV_VAR as _PATH_MAP_ENV_VAR
 from .storage import result_cache_invalidate as _result_cache_invalidate
+from .storage import write_pulse as _write_pulse
 
 try:
-    from .watcher import watch_folders, WatcherError
+    from .watcher import watch_folders, WatcherError, WatcherManager
 except ImportError:
     watch_folders = None  # type: ignore[assignment, misc]
+    WatcherManager = None  # type: ignore[assignment, misc]
     WatcherError = type("WatcherError", (Exception,), {})  # type: ignore[assignment, misc]
+
+# Global watcher manager instance (set in _run_server_with_watcher)
+_watcher_manager: Optional["WatcherManager"] = None
 
 
 # Canonical list of all registered tool names (unfiltered).
@@ -52,26 +58,274 @@ _CANONICAL_TOOL_NAMES: tuple[str, ...] = (
     "get_call_hierarchy",
     # Impact & Safety
     "get_blast_radius", "check_rename_safe", "get_impact_preview",
-    "get_changed_symbols",
+    "get_changed_symbols", "plan_refactoring", "get_symbol_provenance",
+    "get_pr_risk_profile",
     # Architecture
     "get_dependency_cycles", "get_coupling_metrics", "get_layer_violations",
-    "get_extraction_candidates", "get_cross_repo_map",
+    "get_extraction_candidates", "get_cross_repo_map", "get_tectonic_map", "get_signal_chains",
+    "render_diagram", "get_project_intel",
     # Quality & Metrics
     "get_symbol_complexity", "get_churn_rate", "get_hotspots",
     "get_repo_health", "get_symbol_importance", "find_dead_code",
-    "get_dead_code_v2",
+    "get_dead_code_v2", "get_untested_symbols", "search_ast",
     # Diffs & Embeddings
     "get_symbol_diff", "embed_repo",
     # Utilities
-    "get_session_stats", "invalidate_cache", "test_summarizer",
+    "get_session_stats", "get_session_context", "get_session_snapshot", "plan_turn", "register_edit", "invalidate_cache", "test_summarizer",
     "audit_agent_config",
+    # Runtime tier switching
+    "set_tool_tier", "announce_model",
+    # Composite retrieval
+    "winnow_symbols",
 )
+
+# --------------------------------------------------------------------------- #
+# Tool profiles: tiered sets for controlling context budget.                   #
+# core ⊂ standard ⊂ full.  Config key: tool_profile (default "full").         #
+# --------------------------------------------------------------------------- #
+_TOOL_TIER_CORE: frozenset[str] = frozenset({
+    # Indexing
+    "index_repo", "index_folder", "index_file",
+    # Discovery
+    "list_repos", "resolve_repo", "get_repo_outline",
+    "get_file_tree", "get_file_outline",
+    # Search & Retrieval
+    "search_symbols", "get_symbol_source", "get_file_content",
+    "search_text", "get_context_bundle", "get_ranked_context",
+    # Relationships
+    "find_importers", "find_references",
+})
+
+_TOOL_TIER_STANDARD: frozenset[str] = _TOOL_TIER_CORE | frozenset({
+    # Indexing extras
+    "summarize_repo", "embed_repo",
+    # Discovery extras
+    "suggest_queries", "search_columns",
+    # Relationships
+    "check_references", "get_dependency_graph",
+    "get_class_hierarchy", "get_related_symbols", "get_call_hierarchy",
+    # Impact & Safety
+    "get_blast_radius", "check_rename_safe",
+    "get_impact_preview", "get_changed_symbols", "get_symbol_diff",
+    "get_symbol_provenance", "get_pr_risk_profile",
+    # Quality & Metrics
+    "get_symbol_complexity", "get_churn_rate", "get_hotspots",
+    "get_symbol_importance", "find_dead_code", "get_dead_code_v2",
+    "get_untested_symbols", "get_repo_health", "search_ast", "winnow_symbols",
+    # Architecture
+    "get_dependency_cycles", "get_coupling_metrics", "get_layer_violations",
+    "get_cross_repo_map", "get_tectonic_map", "get_signal_chains",
+    "render_diagram", "get_project_intel",
+    # Utilities
+    "invalidate_cache",
+})
+
+# full = everything (no filter applied)
+
+_PROFILE_TIERS: dict[str, frozenset[str] | None] = {
+    "core": _TOOL_TIER_CORE,
+    "standard": _TOOL_TIER_STANDARD,
+    "full": None,  # None = no filtering
+}
+
+# Tools that must always remain visible/callable for runtime tier control.
+_ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset({"set_tool_tier", "announce_model"})
+
+# --- Runtime session tier state -------------------------------------------- #
+import threading
+
+_session_tier_override: str | None = None
+_session_tier_lock = threading.Lock()
+
+
+def _set_session_tier(tier: str | None) -> None:
+    """Atomically set the session-level tier override. None clears it."""
+    global _session_tier_override
+    with _session_tier_lock:
+        _session_tier_override = tier
+
+
+def _effective_profile() -> str:
+    """Return the active tier, preferring session override over config."""
+    with _session_tier_lock:
+        override = _session_tier_override
+    if override is not None:
+        return override
+    return config_module.get("tool_profile", "full") or "full"
+
+
+def _resolve_tier_bundle(profile: str) -> frozenset[str] | None:
+    """Return the set of tool names allowed for the given profile.
+
+    Reads from config['tool_tier_bundles'] first, falls back to baked-in
+    _TOOL_TIER_CORE / _TOOL_TIER_STANDARD constants if the config key is
+    missing or malformed. 'full' returns None (no filter).
+    """
+    if profile == "full":
+        return None
+    bundles = config_module.get("tool_tier_bundles") or {}
+    if isinstance(bundles, dict) and isinstance(bundles.get(profile), list):
+        return frozenset(bundles[profile])
+    # Fallback to constants.
+    return _PROFILE_TIERS.get(profile)
+
+
+async def _emit_tools_list_changed() -> None:
+    """Send notifications/tools/list_changed to the client, best-effort.
+
+    No-op if the transport / SDK does not support it.
+    """
+    session = _get_mcp_session(server)
+    if session is None:
+        logger.debug("tools/list_changed skipped: no active MCP session")
+        return
+
+    send_fn = getattr(session, "send_tool_list_changed", None)
+    if send_fn is None:
+        logger.warning("tools/list_changed skipped: session has no send_tool_list_changed()")
+        return
+
+    try:
+        maybe_awaitable = send_fn()
+        if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
+    except (RuntimeError, TypeError, AttributeError) as exc:
+        logger.warning("tools/list_changed notification failed: %s", exc, exc_info=True)
+
+
+def _get_mcp_session(mcp_server: Server | None = None) -> Any | None:
+    """Best-effort session lookup from an MCP server instance.
+
+    Returns None when no request context/session is available.
+    """
+    srv = mcp_server if mcp_server is not None else globals().get("server")
+    if srv is None:
+        return None
+    try:
+        request_context = srv.request_context
+    except (LookupError, AttributeError):
+        return None
+    if request_context is None:
+        return None
+    return getattr(request_context, "session", None)
+
+
+class HttpAdaptiveTieringError(SystemExit):
+    """Raised to abort startup when adaptive_tiering is combined with HTTP transport."""
+
+
+def _warn_if_http_adaptive_tiering(transport: str) -> None:
+    """Refuse to start when adaptive_tiering is combined with HTTP transport.
+
+    Tier state is process-global, so one client's plan_turn(model=...) flip
+    changes the tool surface visible to every other concurrent client on the
+    same server. That's a misconfiguration, not a heads-up condition — emit
+    an ERROR and abort rather than proceed silently.
+    """
+    if not config_module.get("adaptive_tiering", False):
+        return
+    message = (
+        f"adaptive_tiering: true is incompatible with transport={transport}. "
+        "Tier overrides are process-global and would leak across concurrent HTTP "
+        "clients. Either run under stdio, or set adaptive_tiering: false in config.jsonc."
+    )
+    logger.error(message)
+    raise HttpAdaptiveTieringError(f"refusing to start: {message}")
+
+
+def _log_startup_validation_warnings() -> None:
+    """Emit WARNING logs for any bundle/disabled_tools overlap at startup."""
+    from .tier_resolver import validate_bundle_disabled_overlap
+    try:
+        cfg = {
+            "tool_tier_bundles": config_module.get("tool_tier_bundles") or {},
+            "disabled_tools": config_module.get("disabled_tools") or [],
+        }
+        for msg in validate_bundle_disabled_overlap(cfg):
+            logger.warning(msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("startup validation failed: %s", exc, exc_info=True)
+
+
+async def _apply_model_announcement(model: str) -> dict:
+    """Resolve model → tier, switch if changed, emit list_changed if changed.
+
+    Gated by the adaptive_tiering config flag. When the flag is false
+    (the default), this is a no-op: returns the current tier without
+    switching. set_tool_tier is not affected by this flag because it is
+    an explicit user invocation.
+    """
+    from .tier_resolver import resolve_model_to_tier
+    adaptive = bool(config_module.get("adaptive_tiering", False))
+    if not adaptive:
+        return {
+            "ok": True,
+            "tier": _effective_profile(),
+            "changed": False,
+            "adaptive_tiering": False,
+            "_meta": {
+                "hint": (
+                    "adaptive_tiering is disabled in config.jsonc — "
+                    "model self-report accepted but tier was not "
+                    "switched. Set adaptive_tiering: true to enable."
+                )
+            },
+        }
+
+    mp = config_module.get("model_tier_map") or {}
+    tier, match_reason = resolve_model_to_tier(model, mp)
+    prev = _effective_profile()
+    changed = tier != prev
+    res = {
+        "ok": True,
+        "tier": tier,
+        "changed": changed,
+        "match_reason": match_reason,
+        "adaptive_tiering": True,
+    }
+    if match_reason == "unmatched_fallback":
+        res.setdefault("_meta", {})["warning"] = (
+            f"model {model!r} did not match any entry in model_tier_map; "
+            f"falling back to 'full'. Add a pattern to model_tier_map to "
+            f"route this model explicitly."
+        )
+    if changed:
+        _set_session_tier(tier)
+        await _emit_tools_list_changed()
+    return res
+
+# Parameters stripped from tool schemas when compact_schemas is enabled.
+# These are advanced/rarely-used params that cost tokens every session but
+# are used <5% of the time.  The underlying handler still accepts them.
+_COMPACT_STRIP_PARAMS: dict[str, set[str]] = {
+    "search_symbols": {
+        "debug", "fusion", "semantic", "semantic_only", "semantic_weight",
+        "fuzzy", "fuzzy_threshold", "max_edit_distance", "sort_by", "fqn",
+        "decorator", "token_budget",
+    },
+    "get_context_bundle": {"budget_strategy"},
+    "get_ranked_context": {"detail_level"},
+    "get_blast_radius": {"cross_repo", "max_depth"},
+    "find_importers": {"cross_repo"},
+    "get_dependency_graph": {"cross_repo"},
+    "index_repo": {"extra_ignore_patterns", "incremental"},
+    "index_folder": {"extra_ignore_patterns", "incremental"},
+}
+
+# Tools eligible for Agent Selector complexity scoring
+_AGENT_SELECTOR_TOOLS = frozenset({
+    "get_ranked_context", "get_context_bundle", "search_symbols",
+    "search_text", "get_symbol_source", "plan_turn",
+    "get_blast_radius", "get_impact_preview", "get_dependency_graph",
+})
 
 # Tools excluded from strict freshness mode (don't wait for reindex)
 _EXCLUDED_FROM_STRICT = frozenset({
     "list_repos",
     "resolve_repo",
     "get_session_stats",
+    "get_session_context",
+    "get_session_snapshot",
     "test_summarizer",
     "index_repo",
     "index_folder",
@@ -95,6 +349,133 @@ def _default_use_ai_summaries() -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
+
+# ---------------------------------------------------------------------------
+# Session state persistence (Feature 10: Session-Aware Routing)
+# ---------------------------------------------------------------------------
+
+_session_state_restored = False
+
+
+def _restore_session_state() -> None:
+    """Load and restore session state on server startup.
+    
+    Called from run_stdio_server / run_sse_server / run_streamable_http_server.
+    Restores journal entries and search cache from previous session.
+    """
+    global _session_state_restored
+    if _session_state_restored:
+        return
+    
+    if not config_module.get("session_resume", False):
+        return
+    
+    try:
+        from .tools.session_state import get_session_state
+        from .tools.session_journal import get_journal
+        from .tools.search_symbols import _result_cache, _result_cache_lock
+        from .storage import SQLiteIndexStore
+        
+        state = get_session_state()
+        max_age = config_module.get("session_max_age_minutes", 30)
+        
+        loaded = state.load(max_age_minutes=max_age)
+        if not loaded:
+            logger.debug("No session state to restore")
+            return
+        
+        # Restore journal
+        journal = get_journal()
+        count = state.restore_journal(journal, loaded)
+        logger.info("Restored %d session journal entries", count)
+        
+        # Build current_indexes for cache restoration
+        storage_path = os.environ.get("CODE_INDEX_PATH", "")
+        store = SQLiteIndexStore(base_path=storage_path)
+        current_indexes = {}
+        try:
+            repos = store.list_repos()
+            for r in repos:
+                # list_repos already returns indexed_at — no need to load full index
+                repo_id = r.get("repo", f"{r.get('owner', '')}/{r.get('name', '')}")
+                indexed_at = r.get("indexed_at", "")
+                if indexed_at:
+                    current_indexes[repo_id] = indexed_at
+        except Exception:
+            pass
+        
+        # Restore search cache
+        with _result_cache_lock:
+            count = state.restore_search_cache(_result_cache, loaded, current_indexes)
+        logger.info("Restored %d search cache entries", count)
+        
+        _session_state_restored = True
+        
+    except Exception as e:
+        logger.warning("Failed to restore session state: %s", e)
+
+
+def _save_session_state() -> None:
+    """Save session state on server shutdown.
+    
+    Registered with atexit for clean shutdown.
+    """
+    if not config_module.get("session_resume", False):
+        return
+    
+    try:
+        from .tools.session_state import get_session_state
+        from .tools.session_journal import get_journal
+        from .tools.search_symbols import _result_cache, _result_cache_lock
+        
+        state = get_session_state()
+        journal = get_journal()
+        max_queries = config_module.get("session_max_queries", 50)
+        
+        neg_log = journal.get_negative_evidence_log()
+        with _result_cache_lock:
+            state.save(journal, _result_cache, max_queries=max_queries,
+                       negative_evidence_log=neg_log)
+        
+        logger.info("Saved session state")
+        
+    except Exception as e:
+        logger.warning("Failed to save session state: %s", e)
+
+
+# Register atexit handler for session state persistence
+atexit.register(_save_session_state)
+
+
+def _cleanup_mermaid_temp_startup() -> None:
+    """Clean stale mermaid viewer temp files from previous sessions."""
+    if not config_module.get("render_diagram_viewer_enabled", False):
+        return
+    try:
+        from .tools.mermaid_viewer import cleanup_temp_dir
+        cleanup_temp_dir()
+    except Exception as e:
+        logger.debug("Mermaid temp startup cleanup failed: %s", e, exc_info=True)
+
+
+def _cleanup_mermaid_temp_shutdown() -> None:
+    """Clean mermaid viewer temp files only if viewer was used this session."""
+    if not config_module.get("render_diagram_viewer_enabled", False):
+        return
+    try:
+        from .tools.mermaid_viewer import cleanup_temp_dir, was_viewer_used
+        if not was_viewer_used():
+            return
+        cleanup_temp_dir()
+    except Exception as e:
+        logger.debug("Mermaid temp shutdown cleanup failed: %s", e, exc_info=True)
+
+
+# Startup: clean stale files from previous sessions.
+_cleanup_mermaid_temp_startup()
+# Shutdown: clean only if viewer was actually used this session.
+atexit.register(_cleanup_mermaid_temp_shutdown)
 
 
 def _parse_watcher_flag(value: Optional[str]) -> bool:
@@ -196,7 +577,7 @@ async def list_tools() -> list[Tool]:
 
 def _build_tools_list() -> list[Tool]:
     """Build the full tool list, applying config-driven filtering and overrides."""
-    tools = [
+    all_tools = [
         Tool(
             name="index_repo",
             description="Index a GitHub repository's source code. Fetches files, parses ASTs, extracts symbols, and saves to local storage. Set JCODEMUNCH_USE_AI_SUMMARIES=false to disable AI summaries globally.",
@@ -487,6 +868,10 @@ def _build_tools_list() -> list[Tool]:
                         "description": "Optional filter by language",
                         "enum": _build_language_enum()
                     },
+                    "decorator": {
+                        "type": "string",
+                        "description": "Optional filter: only return symbols with this decorator (case-insensitive substring match, e.g. 'route', 'property', 'Deprecated')"
+                    },
                     "max_results": {
                         "type": "integer",
                         "description": "Maximum number of results to return (ignored when token_budget is set)",
@@ -541,6 +926,11 @@ def _build_tools_list() -> list[Tool]:
                     "semantic_only": {
                         "type": "boolean",
                         "description": "Skip BM25 entirely and rank solely by embedding cosine similarity. Implies semantic=true.",
+                        "default": False
+                    },
+                    "fusion": {
+                        "type": "boolean",
+                        "description": "Enable multi-signal fusion (Weighted Reciprocal Rank) across lexical, structural, similarity, and identity channels. Produces higher-quality ranking than linear score addition. When True, sort_by is ignored.",
                         "default": False
                     },
                     "fqn": {
@@ -772,6 +1162,112 @@ def _build_tools_list() -> list[Tool]:
             }
         ),
         Tool(
+            name="get_session_context",
+            description="Get the current session context — files accessed, searches performed, and edits registered during this MCP session. Use to avoid re-reading the same files.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Maximum number of files to return in files_accessed.",
+                        "default": 50,
+                    },
+                    "max_queries": {
+                        "type": "integer",
+                        "description": "Maximum number of queries to return in recent_searches.",
+                        "default": 20,
+                    },
+                },
+            }
+        ),
+        Tool(
+            name="get_session_snapshot",
+            description="Get a compact session snapshot for context continuity. Returns a ~200 token markdown summary of files explored, edits made, searches performed, and dead ends. Designed for injection after context compaction to restore session orientation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_files": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Maximum focus files to include.",
+                    },
+                    "max_searches": {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Maximum key searches to include.",
+                    },
+                    "max_edits": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Maximum edited files to include.",
+                    },
+                    "include_negative_evidence": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Include dead-end searches (negative evidence) in snapshot.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="plan_turn",
+            description="Plan the next turn by analyzing query against the codebase. Returns confidence level (high/medium/low), recommended symbols/files, and guidance. Use as opening move for any task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "What you're looking for (task description or symbol name).",
+                    },
+                    "max_recommended": {
+                        "type": "integer",
+                        "description": "Maximum number of symbols to recommend.",
+                        "default": 5,
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Your active model identifier (e.g. 'claude-haiku-4-5'). "
+                            "When supplied and adaptive_tiering is enabled, plan_turn invokes "
+                            "the tier-switch logic as a side effect — the exposed tool list is "
+                            "narrowed to the tier mapped to this model via config.jsonc:"
+                            "model_tier_map. Prefer this form over calling announce_model "
+                            "separately — it adds zero extra requests."
+                        ),
+                    },
+                },
+                "required": ["repo", "query"],
+            }
+        ),
+        Tool(
+            name="register_edit",
+            description="Register file edits to invalidate caches. Call after editing files to clear BM25 cache and search result cache for the repo.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier.",
+                    },
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of file paths that were edited.",
+                    },
+                    "reindex": {
+                        "type": "boolean",
+                        "description": "If True, also reindex the files.",
+                        "default": False,
+                    },
+                },
+                "required": ["repo", "file_paths"],
+            }
+        ),
+        Tool(
             name="test_summarizer",
             description="Verify AI summarizer config and connectivity.",
             inputSchema={
@@ -895,7 +1391,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_blast_radius",
-            description="Find all files affected by changing a symbol. Returns confirmed files (import + name match) and potential files (import only, e.g. wildcard). Use before renaming or deleting a symbol. Set cross_repo=true to also find consumers in other indexed repos.",
+            description="Find all files affected by changing a symbol. Returns confirmed files (import + name match) and potential files (import only, e.g. wildcard). Use before renaming or deleting a symbol. Set cross_repo=true to also find consumers in other indexed repos. Set include_source=true to get source snippets at each reference site (fix-ready context in one call). For automated edit plans, use plan_refactoring instead.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -930,6 +1426,20 @@ def _build_tools_list() -> list[Tool]:
                     "fqn": {
                         "type": "string",
                         "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol via PSR-4. Alternative to symbol."
+                    },
+                    "decorator_filter": {
+                        "type": "string",
+                        "description": "Optional: filter confirmed results to only those containing symbols with this decorator (case-insensitive substring match)"
+                    },
+                    "include_source": {
+                        "type": "boolean",
+                        "description": "When true, each confirmed file includes source_snippets (lines referencing the symbol) and symbols_in_file (nearby symbol signatures). Use for fix-ready context without extra tool calls. Default false.",
+                        "default": False,
+                    },
+                    "source_budget": {
+                        "type": "integer",
+                        "description": "Max tokens for source snippets across all files (default 8000). Files are prioritized by reference count.",
+                        "default": 8000,
                     },
                 },
                 "required": ["repo", "symbol"]
@@ -992,6 +1502,72 @@ def _build_tools_list() -> list[Tool]:
                     },
                 },
                 "required": ["repo", "symbol_id"],
+            },
+        ),
+        Tool(
+            name="get_symbol_provenance",
+            description=(
+                "Trace the complete authorship lineage and evolution narrative of a symbol "
+                "through git history. Returns every commit that touched the symbol (or its file), "
+                "classified into semantic categories (creation, bugfix, refactor, feature, perf, "
+                "rename, revert, etc.) with extracted commit intent. Includes a human-readable "
+                "narrative summarising who created it, why, how it evolved, and how volatile it is. "
+                "Use before refactoring unfamiliar code to understand the 'why' behind it. "
+                "Requires a locally indexed repo (index_folder)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name or full ID as returned by search_symbols.",
+                    },
+                    "max_commits": {
+                        "type": "integer",
+                        "description": "Maximum commits to analyse (default 25, max 100).",
+                        "default": 25,
+                    },
+                },
+                "required": ["repo", "symbol"],
+            },
+        ),
+        Tool(
+            name="get_pr_risk_profile",
+            description=(
+                "Produce a unified risk assessment for all changes between two git refs (branch, PR, "
+                "or SHA range). Fuses five signals — blast radius, complexity, churn, test gaps, "
+                "and change volume — into a single composite risk_score (0.0–1.0) with actionable "
+                "recommendations. Returns the top-5 riskiest changed symbols, untested symbols, "
+                "and per-signal breakdowns. Designed for CI gating and code review workflows. "
+                "Requires a locally indexed repo (index_folder)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "base_ref": {
+                        "type": "string",
+                        "description": "Base SHA/ref to compare from. Defaults to the SHA stored at index time.",
+                    },
+                    "head_ref": {
+                        "type": "string",
+                        "description": "Head SHA/ref to compare to (default 'HEAD').",
+                        "default": "HEAD",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Churn look-back window in days (default 90).",
+                        "default": 90,
+                    },
+                },
+                "required": ["repo"],
             },
         ),
         Tool(
@@ -1072,7 +1648,8 @@ def _build_tools_list() -> list[Tool]:
                 "Scans the symbol's own file and every file that imports it, "
                 "looking for an existing symbol with the proposed new name. "
                 "Returns safe=true when no collisions are found. "
-                "Run this before any rename/refactor to avoid silent breakage."
+                "Run this before any rename/refactor to avoid silent breakage. "
+                "For a full rename plan with edits, use plan_refactoring."
             ),
             inputSchema={
                 "type": "object",
@@ -1094,6 +1671,55 @@ def _build_tools_list() -> list[Tool]:
                     },
                 },
                 "required": ["repo", "symbol_id", "new_name"],
+            },
+        ),
+        Tool(
+            name="plan_refactoring",
+            description=(
+                "Generate edit-ready refactoring instructions for renaming, moving, extracting, or "
+                "changing the signature of a symbol. Returns {old_text, new_text} blocks for every "
+                "affected file — directly compatible with Edit tool. Handles import rewrites, "
+                "collision detection, new file generation, and multi-file coordination. "
+                "Use BEFORE executing any multi-file refactoring to get a complete edit plan in one call."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": (
+                            "Symbol name or ID to refactor. For extract, comma-separated list "
+                            "(e.g. 'helper,process_data')."
+                        ),
+                    },
+                    "refactor_type": {
+                        "type": "string",
+                        "enum": ["rename", "move", "extract", "signature"],
+                        "description": "Type of refactoring to plan.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New name for rename operations.",
+                    },
+                    "new_file": {
+                        "type": "string",
+                        "description": "Destination file path for move/extract operations.",
+                    },
+                    "new_signature": {
+                        "type": "string",
+                        "description": "New function signature (e.g. 'foo(x, y, z=0)').",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Import hops to traverse (1-3, default 2).",
+                        "default": 2,
+                    },
+                },
+                "required": ["repo", "symbol", "refactor_type"],
             },
         ),
         Tool(
@@ -1274,6 +1900,98 @@ def _build_tools_list() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_untested_symbols",
+            description=(
+                "Find functions and methods with no evidence of being exercised by any test file. "
+                "Uses import-graph reachability + name matching (AST call_references when available, "
+                "word-boundary text heuristic as fallback). Returns symbols classified as 'unreached' "
+                "(no test file imports the source file) or 'imported_not_called' (test imports the "
+                "module but no test references this specific function). "
+                "This is heuristic reachability, NOT runtime coverage — it answers 'does any test "
+                "reference this symbol?' rather than 'what % of lines are covered.' "
+                "Use after get_repo_health for a deeper quality picture."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "file_pattern": {
+                        "type": "string",
+                        "description": "Optional glob to narrow which source files are analysed (e.g. 'src/**/*.py').",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum confidence to include (0.0–1.0, default 0.5).",
+                        "default": 0.5,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Cap on returned symbols (default 100).",
+                        "default": 100,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="search_ast",
+            description=(
+                "Cross-language AST pattern matching. Finds structural code patterns "
+                "across all 70+ indexed languages using a single query — no need to know "
+                "language-specific AST node types. Two modes: (1) preset anti-patterns "
+                "(empty_catch, bare_except, deeply_nested, nested_loops, god_function, "
+                "eval_exec, hardcoded_secret, todo_fixme, magic_number, reassigned_param), "
+                "or (2) custom mini-DSL (call:*.unwrap, string:/password/i, comment:/TODO/i, "
+                "nesting:5+, loops:3+, lines:80+). Use category='all' to run every preset "
+                "at once, or category='security'/'error_handling'/'complexity'/'performance'/"
+                "'maintenance' for a focused scan. Every match is attributed to its enclosing "
+                "indexed symbol with complexity metadata. Requires a locally indexed repo."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "Preset name (empty_catch, bare_except, deeply_nested, nested_loops, "
+                            "god_function, eval_exec, hardcoded_secret, todo_fixme, magic_number, "
+                            "reassigned_param) or custom query (call:NAME, string:/REGEX/i, "
+                            "comment:/REGEX/i, nesting:N+, loops:N+, lines:N+). "
+                            "Mutually exclusive with category."
+                        ),
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Run all presets in a category: security, error_handling, "
+                            "complexity, performance, maintenance, or all."
+                        ),
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Restrict scan to one language (e.g. 'python', 'typescript').",
+                    },
+                    "file_pattern": {
+                        "type": "string",
+                        "description": "Glob filter on file paths (e.g. 'src/**/*.py').",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Cap on total matches returned (default 50).",
+                        "default": 50,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
             name="get_symbol_importance",
             description=(
                 "Return the most architecturally important symbols in a repo, ranked by "
@@ -1371,6 +2089,11 @@ def _build_tools_list() -> list[Tool]:
                         "type": "string",
                         "description": "Optional glob pattern to limit search to a subdirectory (e.g. 'src/core/*').",
                     },
+                    "fusion": {
+                        "type": "boolean",
+                        "description": "Enable multi-signal fusion (Weighted Reciprocal Rank) for ranking. Combines lexical, structural, and identity channels.",
+                        "default": False,
+                    },
                 },
                 "required": ["repo", "query"],
             },
@@ -1461,16 +2184,295 @@ def _build_tools_list() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="get_tectonic_map",
+            description=(
+                "Discover the logical module topology of a codebase by fusing three coupling signals: "
+                "structural (import edges), behavioral (shared symbol references), and temporal "
+                "(git co-churn). Returns tectonic plates (auto-detected file clusters), each with "
+                "an anchor file, cohesion score, inter-plate coupling, and drifters (files whose "
+                "directory doesn't match their logical module). Detects nexus plates (god-module risk: "
+                "coupled to ≥4 other plates). No k parameter — plate count emerges from the topology. "
+                "Use to find hidden module boundaries, misplaced files, and architectural drift."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Git co-churn look-back window in days (default 90)",
+                        "default": 90,
+                    },
+                    "min_plate_size": {
+                        "type": "integer",
+                        "description": "Minimum files per plate to include; smaller groups go to isolated_files (default 2)",
+                        "default": 2,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="get_signal_chains",
+            description=(
+                "Discover how external signals (HTTP requests, CLI commands, scheduled tasks, events) "
+                "propagate through the codebase via the call graph. Each signal chain traces a path "
+                "from a gateway (entry point) through its callees to leaf symbols. "
+                "Two modes: (1) Discovery — omit symbol to map all chains with orphan detection; "
+                "(2) Lookup — pass a symbol name/ID to find which user-facing chains it participates in "
+                "(e.g. 'validate_email sits on POST /api/users and cli:import-users'). "
+                "Detects gateways from route decorators (Flask/FastAPI/Spring/NestJS/ASP.NET), "
+                "CLI commands (@click, @app.command), task queues (@celery, @dramatiq), event handlers, "
+                "and standard entry points (main.py, __main__.py). "
+                "Use before refactoring to understand which user-facing behaviors depend on a symbol."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name or ID for lookup mode. When provided, returns only chains containing that symbol. Omit for discovery mode (all chains).",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Filter gateways by kind: http, cli, event, task, main, test.",
+                        "enum": ["http", "cli", "event", "task", "main", "test"],
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "BFS depth limit per chain (1–8, default 5).",
+                        "default": 5,
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Include test_* functions as gateways (default false).",
+                        "default": False,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="render_diagram",
+            description=(
+                "Render any graph-producing tool's output as rich, annotated Mermaid markup. "
+                "Pass the raw output dict from get_call_hierarchy, get_signal_chains, "
+                "get_tectonic_map, get_dependency_cycles, get_impact_preview, "
+                "get_blast_radius, or get_dependency_graph. Auto-detects the source tool "
+                "and picks the optimal diagram type: flowchart TD (call hierarchy, blast radius), "
+                "flowchart BT (impact preview), flowchart LR (tectonic plates, dependency graph, "
+                "cycles), or sequenceDiagram (signal chains). Encodes metadata as visual signals: "
+                "edge colors for resolution confidence, node shapes for symbol kind, subgraph "
+                "grouping by file/plate/depth, risk heat coloring. Themes: 'flow' (blue/purple "
+                "depth gradient), 'risk' (red/yellow/green heat), 'minimal' (monochrome). "
+                "Smart pruning keeps output under max_nodes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "object",
+                        "description": "Raw output dict from any supported graph-producing tool.",
+                    },
+                    "theme": {
+                        "type": "string",
+                        "enum": ["flow", "risk", "minimal"],
+                        "description": "Visual theme: 'flow' (architecture), 'risk' (impact), 'minimal' (docs). Default: flow.",
+                        "default": "flow",
+                    },
+                    "max_nodes": {
+                        "type": "integer",
+                        "description": "Maximum nodes before smart pruning (default 80, range 10–200).",
+                        "default": 80,
+                    },
+                    **({
+                        "open_in_viewer": {
+                            "type": "boolean",
+                            "description": (
+                                "When true, also open the rendered mermaid in the local mmd-viewer. "
+                                "The HTML file is written under <index_storage>/temp/mermaid/. "
+                                "Non-fatal: if the viewer is missing, mermaid is returned anyway."
+                            ),
+                            "default": False,
+                        },
+                    } if config_module.get("render_diagram_viewer_enabled", False) else {}),
+                },
+                "required": ["source"],
+            },
+        ),
+        Tool(
+            name="get_project_intel",
+            description=(
+                "Auto-discover and parse non-code knowledge files (Dockerfiles, CI configs, "
+                "docker-compose, K8s manifests, .env templates, Makefiles, package.json scripts) "
+                "and cross-reference them to indexed code symbols. Returns structured intelligence "
+                "grouped by category: infra, ci, config, deps, api, data. "
+                "For categories already in the index (OpenAPI, Terraform, GraphQL, Protobuf, dbt), "
+                "pulls from the index directly. Requires a local index (index_folder)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or display name).",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Category to return: all, infra, ci, config, deps, api, data.",
+                        "default": "all",
+                        "enum": ["all", "infra", "ci", "config", "deps", "api", "data"],
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
+            name="winnow_symbols",
+            description=(
+                "Run a multi-axis constraint query against the index in a single round trip. "
+                "Accepts an ordered list of criteria (AND) intersecting signals no other tool "
+                "composes: kind, language, name (regex), file glob, cyclomatic complexity, "
+                "decorator, direct call references, summary/docstring text, and git churn. "
+                "Survivors are ranked by importance (PageRank, default), complexity, churn, "
+                "or name. Use for questions like 'complex untested functions that call db.Exec' "
+                "or 'deprecated methods still churning in the last 30 days' — cases that would "
+                "otherwise require 4-5 separate calls and client-side merging."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "criteria": {
+                        "type": "array",
+                        "description": (
+                            "Ordered list of filters. Each item is {axis, op, value}. "
+                            "Supported axes: kind (in/eq), language (in/eq), name (eq/matches), "
+                            "file (matches - glob), complexity (>,<,>=,<=,==), decorator (contains), "
+                            "calls (contains - matches call_references), summary (contains), "
+                            "churn (>,<,>=,<=,== with optional window_days, default 90). "
+                            "All criteria must match (AND)."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "axis": {"type": "string"},
+                                "op": {"type": "string"},
+                                "value": {},
+                                "window_days": {
+                                    "type": "integer",
+                                    "description": "Only used when axis='churn'. Days of git history to scan (default 90).",
+                                },
+                            },
+                            "required": ["axis", "op", "value"],
+                        },
+                    },
+                    "rank_by": {
+                        "type": "string",
+                        "enum": ["importance", "complexity", "churn", "name"],
+                        "default": "importance",
+                        "description": "Ranking axis for survivors.",
+                    },
+                    "order": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "default": "desc",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Hard cap on returned results.",
+                    },
+                },
+                "required": ["repo", "criteria"],
+            },
+        ),
+        # --- Runtime tier-switch tools (always force-included below) ---------
+        Tool(
+            name="set_tool_tier",
+            description=(
+                "Explicit tier override for the current session. "
+                "Narrows or widens the exposed tool list to 'core' / 'standard' / 'full'. "
+                "Prefer plan_turn(model=...) for routine per-task use; use "
+                "set_tool_tier only when you need an explicit override (e.g. escalate "
+                "mid-task to 'full' after a capability-gated failure)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tier": {
+                        "type": "string",
+                        "enum": ["core", "standard", "full"],
+                    },
+                },
+                "required": ["tier"],
+            },
+        ),
+        Tool(
+            name="announce_model",
+            description=(
+                "Agent self-reports its active model identifier. Server resolves to a "
+                "tier via model_tier_map (fuzzy: normalize → exact → glob → substring "
+                "→ '*' → 'full') and narrows the exposed tool list accordingly. "
+                "Idempotent: a second call with the same model is a cheap no-op. "
+                "Prefer calling plan_turn(model=...) for routine per-task use; use "
+                "announce_model as a fallback when plan_turn is not appropriate for "
+                "the current task."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "Your active model identifier, e.g. 'claude-haiku-4-5'."},
+                },
+                "required": ["model"],
+            },
+        ),
     ]
+    # Start with a mutable copy for filtering.
+    tools = list(all_tools)
+    # --- Profile filtering ---------------------------------------------------
+    profile = _effective_profile()
+    allowed = _resolve_tier_bundle(profile)
+    if allowed is not None:
+        tools = [t for t in tools if t.name in allowed]
+
     # Filter out disabled tools
     disabled = config_module.get("disabled_tools", [])
     if disabled:
         tools = [t for t in tools if t.name not in disabled]
 
+    # Force-include runtime tier-switch tools so users can never lose access
+    # to their own tier controls via config edits.
+    present_names = {t.name for t in tools}
+    missing = _ALWAYS_PRESENT_TOOLS - present_names
+    if missing:
+        tools.extend(t for t in all_tools if t.name in missing)
+
     # SQL gating: auto-disable search_columns when SQL not in languages
     languages = config_module.get("languages")
     if languages is not None and "sql" not in languages:
         tools = [t for t in tools if t.name != "search_columns"]
+
+    # --- Compact schemas: strip rarely-used params ---------------------------
+    if config_module.get("compact_schemas", False):
+        for tool in tools:
+            strip_set = _COMPACT_STRIP_PARAMS.get(tool.name)
+            if strip_set and isinstance(tool.inputSchema, dict):
+                props = tool.inputSchema.get("properties")
+                if props:
+                    for param in strip_set:
+                        props.pop(param, None)
 
     # Merge descriptions from config (runs after disabled_tools filter)
     _apply_description_overrides(tools)
@@ -1549,32 +2551,204 @@ a query like `"list repos"` or `"search symbols"` to load the full schema before
 Set `discovery_hint: false` in config.jsonc to suppress the reminder in tool descriptions.
 """
 
+_EXPLORE_PROMPT_TEXT = """\
+# Explore — Build a mental model of an unfamiliar repo
+
+Goal: Onboard to a repo you've never seen before.
+
+1. **list_repos** → check if indexed. If not, run **index_folder** (local) or **index_repo** (GitHub).
+2. **get_repo_outline** → directory structure, languages, most-imported files, most-central symbols (PageRank).
+3. **get_repo_health** → dead code %, avg complexity, hotspots, dependency cycles, unstable modules.
+4. **get_file_outline** on the 2–3 most-central files → understand the core.
+5. **get_class_hierarchy** → inheritance structure (if OOP codebase).
+6. **get_dependency_graph** on the entry point file (`direction="importers"`, `depth=2`) → what depends on the core.
+7. **search_symbols** with `sort_by="centrality"` → find the most important symbols across the repo.
+"""
+
+_ASSESS_PROMPT_TEXT = """\
+# Assess — Pre-merge impact analysis
+
+Goal: Understand the blast radius of a change before merging.
+
+**Quick path** (one call): **get_pr_risk_profile** → unified risk score fusing blast radius, \
+complexity, churn, test gaps, and change volume. Includes actionable recommendations.
+
+**Deep path** (manual drill-down):
+1. **get_changed_symbols** → map the git diff to added/removed/modified/renamed symbols.
+2. **get_blast_radius** on each changed file → depth-scored transitive impact + `has_test_reach` per file.
+3. **get_impact_preview** on key changed symbols → "what breaks?" analysis.
+4. **get_symbol_provenance** on unfamiliar symbols → understand why the code exists before changing it.
+5. **check_rename_safe** if any symbols were renamed → verify no broken refs.
+6. **get_untested_symbols** on affected files → flag unreached symbols in the blast radius.
+7. **get_coupling_metrics** on changed files → check if the change increases coupling.
+8. **get_dependency_cycles** → check if the change introduces new cycles.
+9. **search_ast** with `category='security'` on changed files → catch hardcoded secrets or eval() calls in the diff.
+"""
+
+_TRIAGE_PROMPT_TEXT = """\
+# Triage — Diagnose a repo's code quality
+
+Goal: Get a complete health picture in one guided session.
+
+1. **get_repo_health** → one-call snapshot (dead code %, complexity, hotspots, cycles, unstable modules).
+2. **find_dead_code** with `min_confidence=0.8` → high-confidence dead code candidates for removal.
+3. **get_untested_symbols** → functions with no test-file reachability.
+4. **get_dependency_cycles** → full cycle list with file paths.
+5. **get_hotspots** with `top_n=10`, `days=90` → highest-risk symbols by complexity × churn.
+6. **get_layer_violations** → architectural boundary violations.
+7. **get_extraction_candidates** → functions that should be refactored out.
+8. **get_coupling_metrics** on hotspot files → instability analysis.
+9. **search_ast** with `category='all'` → sweep for anti-patterns (empty catches, god functions, magic numbers, etc.).
+"""
+
+_TRACE_PROMPT_TEXT = """\
+# Trace — Investigate a bug through the call graph
+
+Goal: Follow a suspected bug from symptom to root cause.
+
+1. **search_symbols** for the function name or error message keyword.
+2. **get_symbol_source** on the suspect symbol → read the implementation.
+3. **get_call_hierarchy** with `direction="callers"`, `depth=3` → who calls this?
+4. **get_call_hierarchy** with `direction="callees"`, `depth=2` → what does it call?
+5. **get_context_bundle** on the suspect symbol → full source + imports in one call.
+6. **find_references** for the symbol name → all files that reference it.
+7. **get_blast_radius** on the suspect file → what else could be affected?
+8. **get_symbol_diff** if a recent change is suspected → compare current vs. previous version.
+"""
+
 
 @server.list_prompts()
 async def list_prompts() -> list[Prompt]:
-    """Return the workflow guidance prompt."""
+    """Return available workflow guidance prompts."""
     return [
         Prompt(
             name="workflow",
             description="Step-by-step guide for using jcodemunch-mcp tools in Claude Code.",
-        )
+        ),
+        Prompt(
+            name="explore",
+            description="Build a mental model of an unfamiliar repo.",
+        ),
+        Prompt(
+            name="assess",
+            description="Pre-merge impact analysis — blast radius, reachability, coupling.",
+        ),
+        Prompt(
+            name="triage",
+            description="Diagnose a repo's code quality — dead code, hotspots, cycles.",
+        ),
+        Prompt(
+            name="trace",
+            description="Investigate a bug through the call graph from symptom to root cause.",
+        ),
     ]
+
+
+_PROMPT_MAP: dict[str, tuple[str, str]] = {
+    "workflow": (_WORKFLOW_PROMPT_TEXT, "jcodemunch-mcp workflow guide for Claude Code."),
+    "explore": (_EXPLORE_PROMPT_TEXT, "Explore — build a mental model of an unfamiliar repo."),
+    "assess": (_ASSESS_PROMPT_TEXT, "Assess — pre-merge impact analysis."),
+    "triage": (_TRIAGE_PROMPT_TEXT, "Triage — diagnose a repo's code quality."),
+    "trace": (_TRACE_PROMPT_TEXT, "Trace — investigate a bug through the call graph."),
+}
 
 
 @server.get_prompt()
 async def get_prompt(name: str, arguments: dict | None = None) -> GetPromptResult:
     """Return the requested prompt content."""
-    if name == "workflow":
-        return GetPromptResult(
-            description="jcodemunch-mcp workflow guide for Claude Code.",
-            messages=[
-                PromptMessage(
-                    role="user",
-                    content=TextContent(type="text", text=_WORKFLOW_PROMPT_TEXT),
-                )
-            ],
-        )
-    raise ValueError(f"Unknown prompt: {name}")
+    entry = _PROMPT_MAP.get(name)
+    if entry is None:
+        raise ValueError(f"Unknown prompt: {name}")
+    text, description = entry
+    return GetPromptResult(
+        description=description,
+        messages=[
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=text),
+            )
+        ],
+    )
+
+
+# Tools excluded from auto-watch (no folder target, meta-only, or file-path arg)
+_AUTO_WATCH_EXCLUDED = frozenset({
+    "list_repos",
+    "get_session_stats",
+    "get_session_context",
+    "get_session_snapshot",
+    "index_file",  # path arg is a file path, not a folder; requires repo already indexed
+})
+
+
+def _get_source_root(repo: str, storage_path: Optional[str]) -> Optional[str]:
+    """Resolve repo ID to folder path using IndexStore public API.
+
+    Returns None if the repo is not indexed.
+    """
+    # Parse owner/name from repo ID (format: "owner/name" or "local/name-hash")
+    parts = repo.split("/", 1)
+    if len(parts) != 2:
+        return None
+    owner, name = parts
+
+    try:
+        from .storage import IndexStore
+        store = IndexStore(base_path=storage_path)
+        return store.get_source_root(owner, name)
+    except Exception:
+        logger.debug("Failed to resolve source_root for %s", repo, exc_info=True)
+        return None
+
+
+async def _auto_watch_if_needed(name: str, arguments: dict, storage_path: Optional[str]) -> None:
+    """Auto-watch hook: ensure unwatched repos are indexed before tool execution.
+
+    Hook fires BEFORE tool dispatch to ensure the tool runs against fresh data.
+    """
+    global _watcher_manager
+
+    # Check if watcher is running and auto-watch is enabled
+    if _watcher_manager is None:
+        return
+
+    if not config_module.get("watch", False):
+        return
+
+    # Check if tool is excluded
+    if name in _AUTO_WATCH_EXCLUDED:
+        return
+
+    # Extract folder from arguments
+    folder: Optional[str] = None
+
+    # Path-based tools
+    if "path" in arguments:
+        try:
+            folder = str(Path(arguments["path"]).expanduser().resolve())
+        except Exception:
+            pass
+
+    # Repo-based tools
+    if not folder and "repo" in arguments:
+        repo = arguments["repo"]
+        if repo:
+            folder = _get_source_root(repo, storage_path)
+
+    if not folder:
+        return
+
+    # Check if already watched
+    if _watcher_manager.is_watched(folder):
+        return
+
+    # Race-safe reindex, then start watching
+    try:
+        await _watcher_manager.ensure_indexed(folder)
+        await _watcher_manager.add_folder(folder)
+        logger.debug("Auto-watch: indexed and watching %s", folder)
+    except Exception:
+        logger.debug("Auto-watch failed for %s", folder, exc_info=True)
 
 
 @server.call_tool(validate_input=False)
@@ -1584,6 +2758,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     logger.info("tool_call: %s args=%s", name, {k: v for k, v in arguments.items() if k != "content"})
 
     try:   # main handler try starts here, before coerce
+        # Extract cross-cutting args that are not part of any tool's schema.
+        # `format` controls compact-output encoding (see .encoding package).
+        _requested_format = None
+        if isinstance(arguments, dict) and "format" in arguments:
+            _requested_format = arguments.pop("format")
         # Coerce stringified booleans/integers/numbers before routing
         schema = (await _ensure_tool_schemas()).get(name)
         if schema:
@@ -1606,7 +2785,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Project-level tool disabling: check if tool is disabled for this project
         # Global disabled tools are filtered out in list_tools() schema; project-level
         # rejection happens here since schema is global (can't be changed per-project).
-        if config_module.is_tool_disabled(name, repo=repo_arg):
+        if name not in _ALWAYS_PRESENT_TOOLS and config_module.is_tool_disabled(name, repo=repo_arg):
             return [TextContent(type="text", text=json.dumps({
                 "error": (
                     f"Tool '{name}' is disabled in this project's configuration. "
@@ -1614,6 +2793,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"in the .jcodemunch.jsonc file. Remove '{name}' from 'disabled_tools' to re-enable."
                 )
             }, indent=2))]
+
+        # Auto-watch: ensure unwatched repos are indexed before tool execution
+        try:
+            await _auto_watch_if_needed(name, arguments, storage_path)
+        except Exception:
+            logger.debug("Auto-watch check failed", exc_info=True)
+
+        # Progress notifications for long-running tools
+        _progress_cb = None
+        if name in ("index_repo", "index_folder", "index_file", "embed_repo"):
+            try:
+                from .progress import make_progress_notify, ProgressReporter
+                _progress_notify = make_progress_notify(server)
+                if _progress_notify:
+                    _label = {"index_repo": "Index", "index_folder": "Index",
+                              "index_file": "Index", "embed_repo": "Embed"}[name]
+                    _reporter = ProgressReporter(_progress_notify, _label)
+                    _progress_cb = _reporter.update
+                    _reporter_ref = _reporter  # prevent GC
+            except Exception:
+                logger.debug("Progress setup failed", exc_info=True)
 
         if name == "index_repo":
             from .tools.index_repo import index_repo
@@ -1623,6 +2823,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 storage_path=storage_path,
                 incremental=arguments.get("incremental", True),
                 extra_ignore_patterns=arguments.get("extra_ignore_patterns"),
+                progress_cb=_progress_cb,
             )
             _result_cache_invalidate()
         elif name == "index_folder":
@@ -1637,6 +2838,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     extra_ignore_patterns=arguments.get("extra_ignore_patterns"),
                     follow_symlinks=arguments.get("follow_symlinks", False),
                     incremental=arguments.get("incremental", True),
+                    progress_cb=_progress_cb,
                 )
             )
             _result_cache_invalidate()
@@ -1660,6 +2862,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     use_ai_summaries=_ai,
                     storage_path=storage_path,
                     context_providers=arguments.get("context_providers", True),
+                    progress_cb=_progress_cb,
                 )
             )
             _result_cache_invalidate()
@@ -1740,6 +2943,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         kind=kind_filter,
                         file_pattern=arguments.get("file_pattern"),
                         language=arguments.get("language"),
+                        decorator=arguments.get("decorator"),
                         max_results=arguments.get("max_results", 10),
                         token_budget=arguments.get("token_budget"),
                         detail_level=arguments.get("detail_level", "standard"),
@@ -1751,6 +2955,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         semantic=arguments.get("semantic", False),
                         semantic_weight=arguments.get("semantic_weight", 0.5),
                         semantic_only=arguments.get("semantic_only", False),
+                        fusion=arguments.get("fusion", False),
                         storage_path=storage_path,
                         fqn=arguments.get("fqn"),
                     )
@@ -1867,6 +3072,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     strategy=arguments.get("strategy", "combined"),
                     include_kinds=arguments.get("include_kinds"),
                     scope=arguments.get("scope"),
+                    fusion=arguments.get("fusion", False),
                     storage_path=storage_path,
                 )
             )
@@ -1875,6 +3081,57 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = await asyncio.to_thread(
                 functools.partial(
                     get_session_stats,
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_session_context":
+            from .tools.get_session_context import get_session_context
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_session_context,
+                    max_files=arguments.get("max_files", 50),
+                    max_queries=arguments.get("max_queries", 20),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_session_snapshot":
+            from .tools.get_session_snapshot import get_session_snapshot
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_session_snapshot,
+                    max_files=arguments.get("max_files", 10),
+                    max_searches=arguments.get("max_searches", 5),
+                    max_edits=arguments.get("max_edits", 10),
+                    include_negative_evidence=arguments.get("include_negative_evidence", True),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "plan_turn":
+            from .tools.plan_turn import plan_turn
+            # Extract model for tier-switch piggyback before passing to plan_turn
+            model = arguments.pop("model", None) if isinstance(arguments, dict) else None
+            result = await asyncio.to_thread(
+                functools.partial(
+                    plan_turn,
+                    repo=arguments["repo"],
+                    query=arguments["query"],
+                    max_recommended=arguments.get("max_recommended", 5),
+                    storage_path=storage_path,
+                )
+            )
+            announcement = None
+            if isinstance(model, str) and model:
+                announcement = await _apply_model_announcement(model)
+            if announcement is not None and isinstance(result, dict):
+                result["tier_announcement"] = announcement
+        elif name == "register_edit":
+            from .tools.register_edit import register_edit
+            result = await asyncio.to_thread(
+                functools.partial(
+                    register_edit,
+                    repo=arguments["repo"],
+                    file_paths=arguments["file_paths"],
+                    reindex=arguments.get("reindex", False),
                     storage_path=storage_path,
                 )
             )
@@ -1922,6 +3179,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     cross_repo=arguments.get("cross_repo"),
                     call_depth=arguments.get("call_depth", 0),
                     fqn=arguments.get("fqn"),
+                    decorator_filter=arguments.get("decorator_filter"),
+                    include_source=arguments.get("include_source", False),
+                    source_budget=arguments.get("source_budget", 8000),
                 )
             )
         elif name == "get_call_hierarchy":
@@ -1943,6 +3203,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     get_impact_preview,
                     repo=arguments["repo"],
                     symbol_id=arguments["symbol_id"],
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_symbol_provenance":
+            from .tools.get_symbol_provenance import get_symbol_provenance
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_symbol_provenance,
+                    repo=arguments["repo"],
+                    symbol=arguments["symbol"],
+                    max_commits=arguments.get("max_commits", 25),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_pr_risk_profile":
+            from .tools.get_pr_risk_profile import get_pr_risk_profile
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_pr_risk_profile,
+                    repo=arguments["repo"],
+                    base_ref=arguments.get("base_ref"),
+                    head_ref=arguments.get("head_ref", "HEAD"),
+                    days=arguments.get("days", 90),
                     storage_path=storage_path,
                 )
             )
@@ -1983,6 +3266,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     repo=arguments["repo"],
                     symbol_id=arguments["symbol_id"],
                     new_name=arguments["new_name"],
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "plan_refactoring":
+            from .tools.plan_refactoring import plan_refactoring
+            result = await asyncio.to_thread(
+                functools.partial(
+                    plan_refactoring,
+                    repo=arguments["repo"],
+                    symbol=arguments["symbol"],
+                    refactor_type=arguments["refactor_type"],
+                    new_name=arguments.get("new_name"),
+                    new_file=arguments.get("new_file"),
+                    new_signature=arguments.get("new_signature"),
+                    depth=arguments.get("depth", 2),
                     storage_path=storage_path,
                 )
             )
@@ -2117,6 +3415,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     storage_path=storage_path,
                 )
             )
+        elif name == "get_untested_symbols":
+            from .tools.get_untested_symbols import get_untested_symbols
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_untested_symbols,
+                    repo=arguments["repo"],
+                    file_pattern=arguments.get("file_pattern"),
+                    min_confidence=arguments.get("min_confidence", 0.5),
+                    max_results=arguments.get("max_results", 100),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "search_ast":
+            from .tools.search_ast import search_ast
+            result = await asyncio.to_thread(
+                functools.partial(
+                    search_ast,
+                    repo=arguments["repo"],
+                    pattern=arguments.get("pattern"),
+                    category=arguments.get("category"),
+                    language=arguments.get("language"),
+                    file_pattern=arguments.get("file_pattern"),
+                    max_results=arguments.get("max_results", 50),
+                    storage_path=storage_path,
+                )
+            )
         elif name == "get_changed_symbols":
             from .tools.get_changed_symbols import get_changed_symbols
             result = await asyncio.to_thread(
@@ -2139,6 +3463,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     batch_size=arguments.get("batch_size", 50),
                     force=arguments.get("force", False),
                     storage_path=storage_path,
+                    progress_cb=_progress_cb,
                 )
             )
         elif name == "get_cross_repo_map":
@@ -2150,13 +3475,223 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     storage_path=storage_path,
                 )
             )
+        elif name == "get_tectonic_map":
+            from .tools.get_tectonic_map import get_tectonic_map
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_tectonic_map,
+                    repo=arguments["repo"],
+                    days=arguments.get("days", 90),
+                    min_plate_size=arguments.get("min_plate_size", 2),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_signal_chains":
+            from .tools.get_signal_chains import get_signal_chains
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_signal_chains,
+                    repo=arguments["repo"],
+                    symbol=arguments.get("symbol"),
+                    kind=arguments.get("kind"),
+                    max_depth=arguments.get("max_depth", 5),
+                    include_tests=arguments.get("include_tests", False),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "render_diagram":
+            from .tools.render_diagram import render_diagram
+            result = await asyncio.to_thread(
+                functools.partial(
+                    render_diagram,
+                    source=arguments["source"],
+                    theme=arguments.get("theme", "flow"),
+                    max_nodes=arguments.get("max_nodes", 80),
+                    open_in_viewer=arguments.get("open_in_viewer", False),
+                )
+            )
+        elif name == "get_project_intel":
+            from .tools.get_project_intel import get_project_intel
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_project_intel,
+                    repo=arguments["repo"],
+                    category=arguments.get("category", "all"),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "winnow_symbols":
+            from .tools.winnow_symbols import winnow_symbols
+            result = await asyncio.to_thread(
+                functools.partial(
+                    winnow_symbols,
+                    repo=arguments["repo"],
+                    criteria=arguments.get("criteria", []),
+                    rank_by=arguments.get("rank_by", "importance"),
+                    order=arguments.get("order", "desc"),
+                    max_results=arguments.get("max_results", 20),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "set_tool_tier":
+            tier = arguments.get("tier")
+            if tier not in ("core", "standard", "full"):
+                result = {"error": f"invalid tier: {tier!r}"}
+            else:
+                prev = _effective_profile()
+                _set_session_tier(tier)
+                if tier != prev:
+                    await _emit_tools_list_changed()
+                result = {"ok": True, "tier": tier, "changed": tier != prev}
+        elif name == "announce_model":
+            model = arguments.get("model", "")
+            if not isinstance(model, str) or not model:
+                result = {"error": "model parameter is required and must be a non-empty string"}
+            else:
+                result = await _apply_model_announcement(model)
         else:
             result = {"error": f"Unknown tool: {name}"}
-        
+
+        # Feature 2: Session journal recording
+        if config_module.get("session_journal", True):
+            try:
+                from .tools.session_journal import get_journal
+                journal = get_journal()
+                journal.record_tool_call(name)
+                # Record file reads for relevant tools
+                if name in {"get_file_content", "get_file_outline", "get_symbol_source", "get_context_bundle"}:
+                    if isinstance(result, dict):
+                        # Extract file paths from result
+                        if name == "get_file_content" and "content" in result:
+                            journal.record_read(arguments.get("file_path", ""), name)
+                        elif name == "get_file_outline" and "symbols" in result:
+                            journal.record_read(arguments.get("file_path", ""), name)
+                        elif name == "get_symbol_source":
+                            # Single symbol_id → flat result with "source"
+                            sym_id = arguments.get("symbol_id", "")
+                            if sym_id and "::" in sym_id:
+                                journal.record_read(sym_id.split("::")[0], name)
+                            # Batch symbol_ids → result has "symbols" list
+                            for sym in result.get("symbols", []):
+                                if "file" in sym:
+                                    journal.record_read(sym["file"], name)
+                        elif name == "get_context_bundle" and "symbols" in result:
+                            # Record all files from the bundle
+                            for sym in result.get("symbols", []):
+                                if "file" in sym:
+                                    journal.record_read(sym["file"], name)
+                # Record searches
+                elif name in {"search_symbols", "search_text"}:
+                    if isinstance(result, dict):
+                        result_count = result.get("result_count", 0)
+                        query = arguments.get("query", "")
+                        if query:
+                            journal.record_search(query, result_count)
+                        # Collect negative evidence for session state persistence
+                        ne = result.get("negative_evidence")
+                        if ne and isinstance(ne, dict):
+                            import time as _t
+                            journal.record_negative_evidence({
+                                "query": query,
+                                "repo": arguments.get("repo", ""),
+                                "verdict": ne.get("verdict", ""),
+                                "scanned_symbols": ne.get("scanned_symbols", 0),
+                                "timestamp": _t.time(),
+                            })
+                elif name == "get_ranked_context":
+                    if isinstance(result, dict):
+                        query = arguments.get("query", "")
+                        if query:
+                            items_included = result.get("items_included", 0)
+                            journal.record_search(query, items_included)
+                        ne = result.get("negative_evidence")
+                        if ne and isinstance(ne, dict):
+                            import time as _t
+                            journal.record_negative_evidence({
+                                "query": query,
+                                "repo": arguments.get("repo", ""),
+                                "verdict": ne.get("verdict", ""),
+                                "scanned_symbols": ne.get("scanned_symbols", 0),
+                                "timestamp": _t.time(),
+                            })
+            except Exception:
+                logger.debug("Journal recording failed", exc_info=True)
+
+        # Feature 7: Turn budget — record output and inject warnings
+        try:
+            budget_tokens = config_module.get("turn_budget_tokens", 20000)
+            if budget_tokens > 0 and isinstance(result, dict):
+                from .tools.turn_budget import get_turn_budget
+                tb = get_turn_budget()
+                # Reconfigure if config changed (thread-safe)
+                tb.configure(budget_tokens, config_module.get("turn_gap_seconds", 30.0))
+                # Auto-compact: downgrade detail_level before dispatch would be ideal,
+                # but result is already computed. Inject warning + flag instead.
+                result_bytes = len(json.dumps(result, default=str))
+                token_count = result_bytes // 4  # ~4 bytes per token
+                budget_info = tb.record_output(token_count)
+                if budget_info.get("budget_warning"):
+                    meta = result.setdefault("_meta", {})
+                    meta["budget_warning"] = budget_info["budget_warning"]
+                    meta["turn_tokens_used"] = budget_info["turn_tokens_used"]
+                    meta["turn_budget_remaining"] = budget_info["turn_budget_remaining"]
+                    if tb.should_compact():
+                        meta["auto_compacted"] = True
+                    # Also promote to top-level for visibility
+                    result["budget_warning"] = budget_info["budget_warning"]
+            elif budget_tokens > 0:
+                # Still record token count for non-dict results (errors, etc.)
+                from .tools.turn_budget import get_turn_budget
+                tb = get_turn_budget()
+                tb.configure(budget_tokens, config_module.get("turn_gap_seconds", 30.0))
+                # Approximate token count for non-dict results
+                tb.record_output(len(json.dumps(result, default=str)) // 4)
+        except Exception:
+            logger.debug("Turn budget recording failed", exc_info=True)
+
+        # Agent Selector: score complexity and annotate result
+        try:
+            agent_selector_cfg = config_module.get("agent_selector", {})
+            if isinstance(agent_selector_cfg, dict) and agent_selector_cfg.get("mode", "off") != "off":
+                if isinstance(result, dict) and "error" not in result and name in _AGENT_SELECTOR_TOOLS:
+                    from .agent_selector import (
+                        AgentSelectorConfig, ComplexitySignals, score_complexity, route,
+                    )
+                    as_config = AgentSelectorConfig.from_config(agent_selector_cfg)
+                    # Build signals from result metadata
+                    signals = ComplexitySignals(
+                        retrievalSetSize=result.get("items_included", result.get("symbol_count", 0)),
+                        symbolCount=result.get("symbol_count", len(result.get("symbols", result.get("context_items", [])))),
+                        crossFileReferences=result.get("cross_file_refs", 0),
+                        crossProjectReferences=result.get("cross_project", False),
+                        languageComplexity=result.get("language_complexity", "standard"),
+                        requestTokenEstimate=result.get("used_tokens", result.get("total_tokens", 0)),
+                    )
+                    assessment = score_complexity(signals, as_config)
+                    current_model = arguments.get("_current_model")
+                    decision = route(assessment, as_config, current_model)
+                    # Annotate result
+                    meta = result.setdefault("_meta", {})
+                    meta["agent_selector"] = {
+                        "score": assessment.score,
+                        "tier": assessment.tier,
+                        "recommendedModel": assessment.recommendedModel,
+                    }
+                    if decision.prompt_text:
+                        result["agent_selector_prompt"] = decision.prompt_text
+                    if decision.metadata_text:
+                        result["agent_selector"] = decision.metadata_text
+        except Exception:
+            logger.debug("Agent selector scoring failed", exc_info=True)
+
         if isinstance(result, dict):
             meta_fields = config_module.get("meta_fields")
             if meta_fields == [] or arguments.get("suppress_meta"):
                 result.pop("_meta", None)
+                # Also strip nested _meta from batch tools (e.g. get_file_outline batch)
+                for _item in result.get("results", []):
+                    if isinstance(_item, dict):
+                        _item.pop("_meta", None)
             elif isinstance(meta_fields, list):
                 # Partial field inclusion — keep only the fields listed in meta_fields,
                 # preserving tool-generated fields (timing_ms, tokens_saved, etc.)
@@ -2169,13 +3704,66 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         _meta[field] = existing_meta[field]
                 if _meta:
                     result["_meta"] = _meta
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+                # Also filter nested _meta from batch tools (e.g. get_file_outline batch)
+                for _item in result.get("results", []):
+                    if isinstance(_item, dict):
+                        _item_meta = _item.pop("_meta", {})
+                        _item_filtered: dict[str, Any] = {f: _item_meta[f] for f in meta_fields if f in _item_meta}
+                        if "powered_by" in meta_fields:
+                            _item_filtered["powered_by"] = "jcodemunch-mcp by jgravelle · https://github.com/jgravelle/jcodemunch-mcp"
+                        if _item_filtered:
+                            _item["_meta"] = _item_filtered
+        # Per-call pulse for downstream consumers (dashboards, monitors)
+        _saved = result.get("_meta", {}).get("tokens_saved", 0) if isinstance(result, dict) else 0
+        _write_pulse(name, tokens_saved=_saved, base_path=storage_path)
+
+        # Response-level secret redaction — scrub leaked credentials
+        # before they reach the LLM context window
+        if isinstance(result, dict):
+            try:
+                from .redact import is_redaction_enabled, redact_dict
+                if is_redaction_enabled():
+                    result, _redact_count = redact_dict(result)
+                    if _redact_count > 0:
+                        meta = result.setdefault("_meta", {})
+                        meta["secrets_redacted"] = _redact_count
+            except Exception:
+                logger.debug("Secret redaction failed", exc_info=True)
+
+        # Compact output encoding (MUNCH). Opt-in via `format` argument or
+        # JCODEMUNCH_DEFAULT_FORMAT env; "auto" falls back to JSON unless
+        # savings clear the gate threshold.
+        try:
+            from .encoding import encode_response
+            from .storage.token_tracker import record_encoding_savings
+            encoded, enc_meta = encode_response(name, result, _requested_format)
+            if enc_meta.get("encoding") != "json":
+                saved = enc_meta.get("encoding_tokens_saved", 0)
+                total_enc = record_encoding_savings(saved, base_path=storage_path, tool_name=name)
+                if isinstance(result, dict):
+                    m = result.setdefault("_meta", {})
+                    m["encoding"] = enc_meta["encoding"]
+                    m["encoding_tokens_saved"] = saved
+                    m["total_encoding_tokens_saved"] = total_enc
+                return [TextContent(type="text", text=encoded)]
+        except Exception:
+            logger.debug("Compact encoding failed; emitting JSON", exc_info=True)
+
+        return [TextContent(type="text", text=json.dumps(result, separators=(',', ':')))]
 
     except KeyError as e:
-        return [TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, indent=2))]
-    except Exception:
+        return [TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, separators=(',', ':')))]
+    except Exception as exc:
         logger.error("call_tool %s failed", name, exc_info=True)
-        return [TextContent(type="text", text=json.dumps({"error": f"Internal error processing {name}"}, indent=2))]
+        summary = " ".join((str(exc).strip().splitlines() or [""])[0].split())
+        summary = f"{type(exc).__name__}: {summary}" if summary else type(exc).__name__
+        if len(summary) > 200:
+            summary = f"{summary[:197].rstrip()}..."
+        payload = {
+            "error": f"Internal error processing {name}",
+            "summary": summary,
+        }
+        return [TextContent(type="text", text=json.dumps(payload, separators=(',', ':')))]
 
 
 async def _run_server_with_watcher(
@@ -2190,7 +3778,9 @@ async def _run_server_with_watcher(
     watcher output and errors go to that file. If log_path is "auto", a temp
     file is created in the system temp directory.
     """
-    if watch_folders is None:
+    global _watcher_manager
+
+    if watch_folders is None or WatcherManager is None:
         raise ImportError(
             "watchfiles is required for --watcher. "
             "Install with: pip install 'jcodemunch-mcp[watch]'"
@@ -2207,41 +3797,75 @@ async def _run_server_with_watcher(
         )
 
     stop_event = asyncio.Event()
-    watcher_task = asyncio.create_task(
-        watch_folders(
-            **watcher_kwargs,
-            stop_event=stop_event,
-            quiet=True,
-            log_file=log_path,
-        ),
-        name="embedded-watcher",
-    )
 
-    # Give watcher a moment to start; detect early failures before blocking on server
-    await asyncio.sleep(0.1)
-    if watcher_task.done() and not watcher_task.cancelled():
-        exc = watcher_task.exception()
-        if exc is not None:
-            logger.warning("Embedded watcher failed to start: %s", exc)
+    _log_path = log_path
+
+    # Open log file handle if provided
+    _log_file_handle: Optional[IO] = None
+    if _log_path:
+        try:
+            _log_file_handle = open(_log_path, "a", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not open watcher log %r: %s — continuing without log", _log_path, exc)
+            _log_file_handle = None
+
+    # Create WatcherManager and add initial paths
+    manager = WatcherManager(
+        debounce_ms=watcher_kwargs.get("debounce_ms", 200),
+        use_ai_summaries=watcher_kwargs.get("use_ai_summaries", True),
+        storage_path=watcher_kwargs.get("storage_path"),
+        extra_ignore_patterns=watcher_kwargs.get("extra_ignore_patterns"),
+        follow_symlinks=watcher_kwargs.get("follow_symlinks", False),
+        quiet=True,
+        log_file_handle=_log_file_handle,
+    )
+    manager._stop_event = stop_event
+
+    # Add initial paths
+    initial_paths = watcher_kwargs.get("paths", [])
+    for path in initial_paths:
+        folder = Path(path).expanduser().resolve()
+        if folder.is_dir():
+            await manager.add_folder(str(folder))
+
+    _watcher_manager = manager
+
+    # Create manager run task (self-restarts on crash)
+    manager_task = asyncio.create_task(
+        manager.run(),
+        name="watcher-manager",
+    )
 
     try:
         await server_coro_func(*server_args)
     except asyncio.CancelledError:
         pass  # Clean shutdown via Ctrl+C
     finally:
+        _watcher_manager = None
         stop_event.set()
-        from .storage import IndexStore
-        IndexStore(base_path=watcher_kwargs.get("storage_path") or os.environ.get("CODE_INDEX_PATH")).close()
+        # Remove all folders
+        for folder in list(manager._watched):
+            await manager.remove_folder(folder)
+        manager.stop()
+        manager_task.cancel()
         try:
-            await asyncio.wait_for(watcher_task, timeout=5.0)
+            await asyncio.wait_for(manager_task, timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            watcher_task.cancel()
+            manager_task.cancel()
             try:
-                await watcher_task
+                await manager_task
             except asyncio.CancelledError:
                 pass
         except (WatcherError, Exception) as exc:
             logger.warning("Watcher stopped with error: %s", exc)
+        # Close log file handle
+        if _log_file_handle is not None:
+            try:
+                _log_file_handle.close()
+            except Exception:
+                pass
+        from .storage import IndexStore
+        IndexStore(base_path=watcher_kwargs.get("storage_path") or os.environ.get("CODE_INDEX_PATH")).close()
 
 
 async def run_stdio_server():
@@ -2255,6 +3879,10 @@ async def run_stdio_server():
         os.path.expanduser(os.environ.get("CODE_INDEX_PATH", "~/.code-index/")),
         _default_use_ai_summaries(),
     )
+    # Feature 10: Restore session state on startup
+    _restore_session_state()
+    # Log tier bundle / disabled_tools overlap warnings
+    _log_startup_validation_warnings()
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -2389,6 +4017,10 @@ async def run_sse_server(host: str, port: int):
         __version__, host, port,
         os.path.expanduser(os.environ.get("CODE_INDEX_PATH", "~/.code-index/")),
     )
+    _warn_if_http_adaptive_tiering("sse")
+    _log_startup_validation_warnings()
+    # Feature 10: Restore session state on startup
+    _restore_session_state()
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
     await uvicorn.Server(config).serve()
 
@@ -2396,8 +4028,8 @@ async def run_sse_server(host: str, port: int):
 async def run_streamable_http_server(host: str, port: int):
     """Run the MCP server with streamable-http transport (persistent HTTP mode)."""
     import sys
+    import uuid
     try:
-        import anyio
         import uvicorn
         from starlette.applications import Starlette
         from starlette.requests import Request
@@ -2407,21 +4039,74 @@ async def run_streamable_http_server(host: str, port: int):
             f"Streamable-http transport requires additional packages: {e}. "
             'Install them with: pip install "jcodemunch-mcp[http]"'
         ) from e
-    from mcp.server.streamable_http import StreamableHTTPServerTransport
+    from mcp.server.streamable_http import StreamableHTTPServerTransport, MCP_SESSION_ID_HEADER
+
+    # Session registry: session_id -> (transport, background_task)
+    # Keeps server.run() alive across multiple HTTP requests from the same client.
+    _sessions: dict[str, StreamableHTTPServerTransport] = {}
+    _session_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
 
     async def handle_mcp(request: Request):
-        transport = StreamableHTTPServerTransport(mcp_session_id=None)
-        async with transport.connect() as (read_stream, write_stream):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(
-                    server.run,
-                    read_stream,
-                    write_stream,
-                    server.create_initialization_options(),
-                )
-                await transport.handle_request(
-                    request.scope, request.receive, request._send
-                )
+        session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+        # Route to existing session if client sent a session ID we recognise.
+        if session_id and session_id in _sessions:
+            transport = _sessions[session_id]
+            await transport.handle_request(request.scope, request.receive, request._send)
+            # Clean up terminated sessions (e.g. after DELETE).
+            if transport._terminated:
+                _sessions.pop(session_id, None)
+                task = _session_tasks.pop(session_id, None)
+                if task and not task.done():
+                    task.cancel()
+            return
+
+        # New session — generate a unique ID so the transport enforces it on
+        # all subsequent requests, preventing cross-session pollution.
+        new_id = uuid.uuid4().hex
+        transport = StreamableHTTPServerTransport(mcp_session_id=new_id)
+        _sessions[new_id] = transport
+
+        # streams_ready is set once transport.connect() has initialised its
+        # internal memory streams.  We must wait for it before calling
+        # handle_request(), which writes to those streams.
+        streams_ready: asyncio.Event = asyncio.Event()
+
+        async def _session_runner() -> None:
+            try:
+                async with transport.connect() as (read_stream, write_stream):
+                    streams_ready.set()
+                    await server.run(
+                        read_stream,
+                        write_stream,
+                        server.create_initialization_options(),
+                    )
+            except asyncio.CancelledError:
+                pass
+            finally:
+                _sessions.pop(new_id, None)
+                _session_tasks.pop(new_id, None)
+
+        task = asyncio.create_task(_session_runner())
+        _session_tasks[new_id] = task
+
+        try:
+            # Wait up to 10 s for the transport to be ready.
+            await asyncio.wait_for(streams_ready.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            _sessions.pop(new_id, None)
+            _session_tasks.pop(new_id, None)
+            from starlette.responses import Response as StarletteResponse
+            err = StarletteResponse("Session setup timed out", status_code=500)
+            await err(request.scope, request.receive, request._send)
+            return
+
+        try:
+            await transport.handle_request(request.scope, request.receive, request._send)
+        except Exception:
+            task.cancel()
+            raise
 
     middleware = []
     auth_mw = _make_auth_middleware()
@@ -2447,6 +4132,10 @@ async def run_streamable_http_server(host: str, port: int):
         __version__, host, port,
         os.path.expanduser(os.environ.get("CODE_INDEX_PATH", "~/.code-index/")),
     )
+    _warn_if_http_adaptive_tiering("streamable-http")
+    _log_startup_validation_warnings()
+    # Feature 10: Restore session state on startup
+    _restore_session_state()
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
     await uvicorn.Server(config).serve()
 
@@ -2523,16 +4212,24 @@ def _generate_claude_md_snippet(missing_only: bool = False) -> str:
                            "get_dependency_graph", "get_class_hierarchy",
                            "get_related_symbols", "get_call_hierarchy"]),
         ("Impact & Safety", ["get_blast_radius", "check_rename_safe",
-                              "get_impact_preview", "get_changed_symbols"]),
+                              "get_impact_preview", "get_changed_symbols",
+                              "plan_refactoring", "get_symbol_provenance",
+                              "get_pr_risk_profile"]),
         ("Architecture", ["get_dependency_cycles", "get_coupling_metrics",
                           "get_layer_violations", "get_extraction_candidates",
-                          "get_cross_repo_map"]),
+                          "get_cross_repo_map", "get_tectonic_map",
+                          "get_signal_chains", "render_diagram",
+                          "get_project_intel"]),
         ("Quality & Metrics", ["get_symbol_complexity", "get_churn_rate", "get_hotspots",
                                 "get_repo_health", "get_symbol_importance",
-                                "find_dead_code", "get_dead_code_v2"]),
+                                "find_dead_code", "get_dead_code_v2",
+                                "get_untested_symbols", "search_ast",
+                                "winnow_symbols"]),
         ("Diffs & Embeddings", ["get_symbol_diff", "embed_repo"]),
+        ("Session-Aware Routing", ["plan_turn", "get_session_context", "get_session_snapshot", "register_edit"]),
         ("Utilities", ["get_session_stats", "invalidate_cache", "test_summarizer",
                         "audit_agent_config"]),
+        ("Runtime Tier Switching", ["set_tool_tier", "announce_model"]),
     ]
     from . import __version__ as _ver
     lines = [
@@ -2725,10 +4422,41 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
     else:
         row("languages", _fmt_list(languages), _detect_source("languages", None))
 
+    # ── Tool Profile ──────────────────────────────────────────────────────
+    section("Tool Profile")
+    profile = _cfg.get("tool_profile", "full")
+    profile_display = {"core": f"{green('core')} (~16 tools)", "standard": f"{yellow('standard')} (~40 tools)", "full": f"{dim('full')} (all tools)"}
+    row("tool_profile", profile_display.get(profile, profile), _detect_source("tool_profile", "full"))
+    compact = _cfg.get("compact_schemas", False)
+    row("compact_schemas", green("enabled") if compact else dim("disabled"), _detect_source("compact_schemas", False))
+
     # ── Disabled Tools ────────────────────────────────────────────────────
     section("Disabled Tools")
     disabled = _cfg.get("disabled_tools", [])
     row("disabled_tools", _fmt_list(disabled) if disabled else dim("(none)"), _detect_source("disabled_tools", []))
+
+    # ── Tool Tiering ──────────────────────────────────────────────────────
+    section("Tool Tiering")
+    adaptive = _cfg.get("adaptive_tiering", False)
+    row("adaptive_tiering", green("enabled") if adaptive else dim("disabled"), _detect_source("adaptive_tiering", False))
+    bundles = _cfg.get("tool_tier_bundles") or {}
+    if isinstance(bundles, dict):
+        for tier_name in ("core", "standard"):
+            tools_in_tier = bundles.get(tier_name, [])
+            if isinstance(tools_in_tier, list):
+                row(f"  {tier_name} tier", f"{len(tools_in_tier)} tools", "config")
+    # Check for bundle/disabled overlap
+    from .tier_resolver import validate_bundle_disabled_overlap
+    overlap_cfg = {
+        "tool_tier_bundles": bundles,
+        "disabled_tools": disabled,
+    }
+    overlap_warnings = validate_bundle_disabled_overlap(overlap_cfg)
+    if overlap_warnings:
+        for msg in overlap_warnings:
+            print(f"  {WARN} {yellow(msg)}")
+    else:
+        print(f"  {CHECK} {green('No bundle/disabled_tools overlap')}")
 
     # ── Descriptions ──────────────────────────────────────────────────────
     section("Descriptions")
@@ -2801,6 +4529,12 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
         print(f"  Active provider:  {yellow('none')} — no API key set, signature fallback active")
         print(f"  {dim('Set ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_BASE, MINIMAX_API_KEY, ZHIPUAI_API_KEY, or OPENROUTER_API_KEY to enable')}")
 
+    allow_remote = _cfg.get("allow_remote_summarizer", False)
+    allow_label = str(allow_remote).lower()
+    if not allow_remote and provider_name:
+        allow_label += f" {dim('(only affects custom base URLs, not standard API endpoints)')}"
+    row("allow_remote_summarizer", allow_label, _detect_source("allow_remote_summarizer", False))
+
     # ── Transport ──────────────────────────────────────────────────────────
     section("Transport")
     transport = _cfg.get("transport", "stdio")
@@ -2837,7 +4571,6 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
     share = _cfg.get("share_savings", True)
     row("share_savings", green("enabled") if share else yellow("disabled"), _detect_source("share_savings", True))
     row("summarizer_concurrency", _cfg.get("summarizer_concurrency", 4), _detect_source("summarizer_concurrency", 4))
-    row("allow_remote_summarizer", str(_cfg.get("allow_remote_summarizer", False)).lower(), _detect_source("allow_remote_summarizer", False))
 
     # ── --check ───────────────────────────────────────────────────────────
     if check:
@@ -2924,38 +4657,55 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
             print(f"  {yellow(WARN)} CLAUDE.md not found: {claude_md_path}")
             print(f"  {dim('  Run: jcodemunch-mcp claude-md --generate > /path/to/CLAUDE.md')}")
 
-        # ── Hook-script drift check ───────────────────────────────────────────
-        section("Hook scripts check")
-        hooks_dir = Path.home() / ".claude" / "hooks"
-        if hooks_dir.exists():
-            read_guards = (
-                list(hooks_dir.glob("jcodemunch_read_guard.sh"))
-                + list(hooks_dir.glob("jcodemunch_read_guard.ps1"))
-            )
-            if read_guards:
-                for _script in sorted(read_guards):
-                    try:
-                        _sc = _script.read_text(encoding="utf-8", errors="replace")
-                        _missing_h = [t for t in canonical_tools if t not in _sc]
-                        if _missing_h:
-                            _wrapped_h = _wrap_names(_missing_h)
-                            print(f"  {yellow(WARN)} {_script.name}: {len(_missing_h)} tool(s) absent from feedback message:")
-                            for _line in _wrapped_h:
-                                print(f"       {dim(_line)}")
-                        else:
-                            print(f"  {green(CHECK)} {_script.name} is current")
-                    except Exception as _e:
-                        print(f"  {yellow(WARN)} {_script.name}: could not read ({_e})")
-            else:
-                print(f"  {dim('(no jcodemunch_read_guard.* hook scripts found)')}")
-            other_hooks = (
-                list(hooks_dir.glob("jcodemunch_edit_guard.*"))
-                + list(hooks_dir.glob("jcodemunch_index_hook.*"))
-            )
-            for _script in sorted(other_hooks):
-                print(f"  {green(CHECK)} {_script.name} present")
+        # ── Hook check ─────────────────────────────────────────────────────────
+        section("Hooks check")
+        _settings_path = Path.home() / ".claude" / "settings.json"
+        _expected_hooks = {
+            "hook-pretooluse": ("PreToolUse", "Read"),
+            "hook-posttooluse": ("PostToolUse", "Edit|Write"),
+            "hook-precompact": ("PreCompact", ""),
+            "hook-taskcomplete": ("TaskCompleted", ""),
+            "hook-subagent-start": ("SubagentStart", ""),
+        }
+        if _settings_path.exists():
+            try:
+                _settings = json.loads(_settings_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                _settings = {}
+            _installed_hooks = _settings.get("hooks", {})
+            _found_any = False
+            for _hook_cmd, (_event, _matcher) in _expected_hooks.items():
+                _marker = f"jcodemunch-mcp {_hook_cmd}"
+                _present = False
+                for _rule in _installed_hooks.get(_event, []):
+                    for _h in _rule.get("hooks", []):
+                        if _marker in _h.get("command", ""):
+                            _present = True
+                            break
+                if _present:
+                    _label = f"{_event}({_matcher})" if _matcher else _event
+                    print(f"  {green(CHECK)} {_hook_cmd} installed [{_label}]")
+                    _found_any = True
+                else:
+                    print(f"  {dim(f'  {_hook_cmd} not installed')}")
+            if not _found_any:
+                print(f"  {dim('  Run: jcodemunch-mcp init --hooks')}")
+            # Warn about legacy shell scripts
+            _hooks_dir = Path.home() / ".claude" / "hooks"
+            if _hooks_dir.exists():
+                _legacy = (
+                    list(_hooks_dir.glob("jcodemunch_read_guard.*"))
+                    + list(_hooks_dir.glob("jcodemunch_edit_guard.*"))
+                    + list(_hooks_dir.glob("jcodemunch_index_hook.*"))
+                )
+                if _legacy:
+                    print(f"  {yellow(WARN)} Legacy shell scripts detected (replaced by Python hooks):")
+                    for _script in sorted(_legacy):
+                        print(f"       {dim(_script.name)}")
+                    print(f"       {dim('These can be removed. Run: jcodemunch-mcp init --hooks')}")
         else:
-            print(f"  {dim('(~/.claude/hooks/ not found — hooks not installed)')}")
+            print(f"  {dim('(~/.claude/settings.json not found — hooks not installed)')}")
+            print(f"  {dim('  Run: jcodemunch-mcp init --hooks')}")
 
         print()
         if issues:
@@ -3128,6 +4878,11 @@ def main(argv: Optional[list[str]] = None):
         metavar="MINUTES",
         help="Auto-shutdown after N minutes with no re-indexing (default: disabled)",
     )
+    watch_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Index all paths once (incremental) and exit immediately — no file watching",
+    )
     _add_common_args(watch_parser)
 
     # --- config ---
@@ -3168,6 +4923,35 @@ def main(argv: Optional[list[str]] = None):
         dest="fmt",
         help="'full' (default) — complete snippet; 'append' — only tools not yet in your CLAUDE.md",
     )
+
+    # --- index-file ---
+    # --- index (full folder/repo index) ---
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Index a local folder or GitHub repo (default: current directory)",
+    )
+    index_parser.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="Local path or owner/repo (default: current directory)",
+    )
+    index_parser.add_argument(
+        "--no-ai-summaries",
+        action="store_true",
+        help="Disable AI-generated summaries",
+    )
+    index_parser.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Include symlinked files in indexing",
+    )
+    index_parser.add_argument(
+        "--extra-ignore",
+        nargs="*",
+        help="Additional gitignore-style patterns to exclude",
+    )
+    _add_common_args(index_parser)
 
     # --- index-file ---
     index_file_parser = subparsers.add_parser(
@@ -3269,6 +5053,24 @@ def main(argv: Optional[list[str]] = None):
         help="PostToolUse hook: auto-reindex files after Edit/Write (reads stdin)",
     )
 
+    # --- hook-precompact ---
+    subparsers.add_parser(
+        "hook-precompact",
+        help="PreCompact hook: generate session snapshot before context compaction (reads stdin)",
+    )
+
+    # --- hook-taskcomplete ---
+    subparsers.add_parser(
+        "hook-taskcomplete",
+        help="TaskCompleted hook: post-task diagnostics — dead code, untested symbols, dangling refs (reads stdin)",
+    )
+
+    # --- hook-subagent-start ---
+    subparsers.add_parser(
+        "hook-subagent-start",
+        help="SubagentStart hook: inject condensed repo orientation for spawned agents (reads stdin)",
+    )
+
     # --- watch-claude ---
     wc_parser = subparsers.add_parser(
         "watch-claude",
@@ -3310,6 +5112,48 @@ def main(argv: Optional[list[str]] = None):
     )
     _add_common_args(wc_parser)
 
+    # --- download-model ---
+    dm_parser = subparsers.add_parser(
+        "download-model",
+        help="Download the bundled ONNX embedding model (all-MiniLM-L6-v2) for zero-config semantic search",
+    )
+    dm_parser.add_argument(
+        "--target-dir",
+        default=None,
+        metavar="PATH",
+        help="Custom directory to store the model (default: ~/.code-index/models/all-MiniLM-L6-v2/)",
+    )
+
+    # --- install-pack ---
+    ip_parser = subparsers.add_parser(
+        "install-pack",
+        help="Download and install a Starter Pack pre-built index",
+    )
+    ip_parser.add_argument(
+        "pack_id",
+        nargs="?",
+        default=None,
+        help="Pack identifier to install (e.g. nodejs, fastapi)",
+    )
+    ip_parser.add_argument(
+        "--license",
+        default=None,
+        dest="license_key",
+        metavar="KEY",
+        help="jCodeMunch license key (required for premium packs)",
+    )
+    ip_parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_packs",
+        help="List all available starter packs",
+    )
+    ip_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download and overwrite an already-installed pack",
+    )
+
     # Backwards compat: if first non-flag arg isn't a known subcommand,
     # prepend "serve" so legacy invocations like `jcodemunch-mcp --transport sse` still work.
     # But let --help and -V be handled by the top-level parser first.
@@ -3318,7 +5162,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "watch-claude", "config", "index-file", "claude-md", "init"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "config", "index", "index-file", "claude-md", "init", "install-pack", "download-model"}
         has_subcommand = any(arg in known_commands for arg in raw_argv if not arg.startswith("-"))
         if not has_subcommand:
             raw_argv = ["serve"] + list(raw_argv)
@@ -3353,6 +5197,26 @@ def main(argv: Optional[list[str]] = None):
             no_backup=args.no_backup,
         ))
 
+    if args.command == "download-model":
+        from .embeddings.local_encoder import download_model as _download_model
+        from pathlib import Path as _Path
+        try:
+            target = _Path(args.target_dir) if args.target_dir else None
+            _download_model(target)
+            sys.exit(0)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)  # noqa: T201
+            sys.exit(1)
+
+    if args.command == "install-pack":
+        from .cli.install_pack import run_install_pack
+        sys.exit(run_install_pack(
+            pack_id=args.pack_id,
+            license_key=args.license_key,
+            list_packs=args.list_packs,
+            force=args.force,
+        ))
+
     if args.command == "hook-pretooluse":
         from .cli.hooks import run_pretooluse
         sys.exit(run_pretooluse())
@@ -3360,6 +5224,18 @@ def main(argv: Optional[list[str]] = None):
     if args.command == "hook-posttooluse":
         from .cli.hooks import run_posttooluse
         sys.exit(run_posttooluse())
+
+    if args.command == "hook-precompact":
+        from .cli.hooks import run_precompact
+        sys.exit(run_precompact())
+
+    if args.command == "hook-taskcomplete":
+        from .cli.hooks import run_taskcomplete
+        sys.exit(run_taskcomplete())
+
+    if args.command == "hook-subagent-start":
+        from .cli.hooks import run_subagentstart
+        sys.exit(run_subagentstart())
 
     # Apply config defaults for watcher keys: CLI args > config > env vars.
     # config.load_config() is called inside each subcommand handler, but we need
@@ -3384,20 +5260,33 @@ def main(argv: Optional[list[str]] = None):
     _setup_logging(args)
 
     if args.command == "watch":
-        from .watcher import watch_folders
-
         use_ai = not args.no_ai_summaries and _default_use_ai_summaries()
-        asyncio.run(
-            watch_folders(
-                paths=args.paths,
-                debounce_ms=args.debounce,
-                use_ai_summaries=use_ai,
-                storage_path=os.environ.get("CODE_INDEX_PATH"),
-                extra_ignore_patterns=args.extra_ignore,
-                follow_symlinks=args.follow_symlinks,
-                idle_timeout_minutes=args.idle_timeout,
+        if args.once:
+            from .watcher import sync_folders
+
+            asyncio.run(
+                sync_folders(
+                    paths=args.paths,
+                    use_ai_summaries=use_ai,
+                    storage_path=os.environ.get("CODE_INDEX_PATH"),
+                    extra_ignore_patterns=args.extra_ignore,
+                    follow_symlinks=args.follow_symlinks,
+                )
             )
-        )
+        else:
+            from .watcher import watch_folders
+
+            asyncio.run(
+                watch_folders(
+                    paths=args.paths,
+                    debounce_ms=args.debounce,
+                    use_ai_summaries=use_ai,
+                    storage_path=os.environ.get("CODE_INDEX_PATH"),
+                    extra_ignore_patterns=args.extra_ignore,
+                    follow_symlinks=args.follow_symlinks,
+                    idle_timeout_minutes=args.idle_timeout,
+                )
+            )
     elif args.command == "hook-event":
         from .hook_event import handle_hook_event
 
@@ -3417,6 +5306,31 @@ def main(argv: Optional[list[str]] = None):
                 follow_symlinks=args.follow_symlinks,
             )
         )
+    elif args.command == "index":
+        import json as _json
+        t = args.target
+        use_ai = not args.no_ai_summaries and _default_use_ai_summaries()
+        # Heuristic: "owner/repo" is a GitHub repo; anything else is a local path
+        is_local = "/" not in t or t.startswith("/") or t.startswith(".") or (len(t) > 1 and t[1] == ":")
+        if is_local:
+            from .tools.index_folder import index_folder as _index_folder
+            result = _index_folder(
+                path=t,
+                use_ai_summaries=use_ai,
+                storage_path=os.environ.get("CODE_INDEX_PATH"),
+                extra_ignore_patterns=args.extra_ignore,
+                follow_symlinks=args.follow_symlinks,
+            )
+        else:
+            from .tools.index_repo import index_repo as _index_repo
+            result = asyncio.run(_index_repo(
+                url=t,
+                use_ai_summaries=use_ai,
+                storage_path=os.environ.get("CODE_INDEX_PATH"),
+            ))
+        print(_json.dumps(result, indent=2))
+        if not result.get("success"):
+            sys.exit(1)
     elif args.command == "index-file":
         from .tools.index_file import index_file as _index_file
         import json as _json
@@ -3435,6 +5349,20 @@ def main(argv: Optional[list[str]] = None):
         # Re-run load_config() after _setup_logging() so config warnings/errors
         # go to the configured log destination (the early call at startup ran before logging was set up)
         config_module.load_config()
+
+        # Clean up orphan indexes whose source_root no longer exists
+        try:
+            from .storage import IndexStore
+
+            storage_path = os.environ.get("CODE_INDEX_PATH")
+            store = IndexStore(base_path=storage_path)
+            cleaned = store.cleanup_orphan_indexes()
+            store.close()
+            if cleaned:
+                logger.info("Cleaned up %d orphan index(es)", cleaned)
+        except Exception:
+            logger.debug("Orphan index cleanup failed", exc_info=True)
+
         config_module.load_all_project_configs()
         from .reindex_state import set_freshness_mode
         # Apply config default if --freshness-mode was not explicitly provided

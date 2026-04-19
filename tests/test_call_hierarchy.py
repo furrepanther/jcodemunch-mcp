@@ -205,10 +205,10 @@ class TestGetCallHierarchy:
         result = get_call_hierarchy(repo=repo, symbol_id="nonexistent_xyz", storage_path=store)
         assert "error" in result
 
-    def test_meta_source_is_text_heuristic(self, tmp_path):
+    def test_meta_source_is_ast_call_references(self, tmp_path):
         repo, store = _build_repo(tmp_path)
         result = get_call_hierarchy(repo=repo, symbol_id="helper", storage_path=store)
-        assert result["_meta"]["source"] == "text_heuristic"
+        assert result["_meta"]["source"] == "ast_call_references"
 
     def test_leaf_symbol_has_no_callers(self, tmp_path):
         """run() is the top-level caller — nothing calls it in our test repo."""
@@ -269,10 +269,10 @@ class TestGetImpactPreview:
             target_id = result["symbol"]["id"]
             assert chain_entry["chain"][0] == target_id
 
-    def test_meta_source_is_text_heuristic(self, tmp_path):
+    def test_meta_source_is_ast_call_references(self, tmp_path):
         repo, store = _build_repo(tmp_path)
         result = get_impact_preview(repo=repo, symbol_id="helper", storage_path=store)
-        assert result["_meta"]["source"] == "text_heuristic"
+        assert result["_meta"]["source"] == "ast_call_references"
 
     def test_call_chain_ends_at_caller(self, tmp_path):
         repo, store = _build_repo(tmp_path)
@@ -427,3 +427,162 @@ class TestFindReferencesCallChain:
         for ref in result["references"]:
             assert "file" in ref
             assert "matches" in ref
+
+
+# ---------------------------------------------------------------------------
+# Same-file caller tests
+# ---------------------------------------------------------------------------
+
+def _build_same_file_repo(tmp_path):
+    """Build a repo where caller and callee are in the same file."""
+    src = tmp_path / "src"
+    store = tmp_path / "store"
+    src.mkdir()
+    store.mkdir()
+
+    (src / "utils.py").write_text(
+        "def helper():\n    return 42\n\n"
+        "def process():\n    return helper() + 1\n\n"
+        "def unrelated():\n    return 99\n"
+    )
+    result = index_folder(str(src), use_ai_summaries=False, storage_path=str(store))
+    assert result["success"] is True
+    return result["repo"], str(store)
+
+
+class TestSameFileCallers:
+    """Callers within the same file should be detected."""
+
+    def test_same_file_caller_found(self, tmp_path):
+        """process() calls helper() in the same file."""
+        repo, store = _build_same_file_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=1, storage_path=store)
+        assert "error" not in result
+        caller_names = [c["name"] for c in result["callers"]]
+        assert "process" in caller_names, f"Expected 'process' in same-file callers, got: {caller_names}"
+
+    def test_same_file_non_caller_excluded(self, tmp_path):
+        """unrelated() does not call helper() — should not appear."""
+        repo, store = _build_same_file_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=1, storage_path=store)
+        caller_names = [c["name"] for c in result["callers"]]
+        assert "unrelated" not in caller_names
+
+    def test_same_file_no_self_reference(self, tmp_path):
+        """helper() should not list itself as a caller."""
+        repo, store = _build_same_file_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=1, storage_path=store)
+        caller_names = [c["name"] for c in result["callers"]]
+        assert "helper" not in caller_names
+
+    def test_same_file_no_duplicate_callers(self, tmp_path):
+        """Each caller should appear only once (no AST + text duplicate)."""
+        repo, store = _build_same_file_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=1, storage_path=store)
+        ids = [c["id"] for c in result["callers"]]
+        assert len(ids) == len(set(ids)), f"Duplicate caller IDs: {ids}"
+
+
+# ---------------------------------------------------------------------------
+# Blast radius decorator_filter tests
+# ---------------------------------------------------------------------------
+
+class TestBlastRadiusDecoratorFilter:
+    """Test decorator_filter parameter in get_blast_radius."""
+
+    def _build_decorator_repo(self, tmp_path):
+        src = tmp_path / "src"
+        store = tmp_path / "store"
+        src.mkdir()
+        store.mkdir()
+
+        (src / "utils.py").write_text(
+            "def helper():\n    return 42\n"
+        )
+        (src / "routes.py").write_text(
+            "from utils import helper\n\n"
+            "def route(path):\n    def decorator(fn):\n        return fn\n    return decorator\n\n"
+            "@route('/api')\n"
+            "def api_handler():\n    return helper()\n"
+        )
+        (src / "service.py").write_text(
+            "from utils import helper\n\n"
+            "def compute():\n    return helper() * 2\n"
+        )
+        result = index_folder(str(src), use_ai_summaries=False, storage_path=str(store))
+        assert result["success"] is True
+        return result["repo"], str(store)
+
+    def test_decorator_filter_narrows_confirmed(self, tmp_path):
+        """Only files with matching decorators should appear when filter is set."""
+        repo, store = self._build_decorator_repo(tmp_path)
+        result = get_blast_radius(
+            repo=repo, symbol="helper", depth=1,
+            decorator_filter="route", storage_path=store
+        )
+        assert "error" not in result
+        confirmed_files = [c["file"] for c in result["confirmed"]]
+        assert any("routes" in f for f in confirmed_files), \
+            f"routes.py should be confirmed, got: {confirmed_files}"
+        assert not any("service" in f for f in confirmed_files), \
+            f"service.py should be filtered out, got: {confirmed_files}"
+
+    def test_no_decorator_filter_includes_all(self, tmp_path):
+        """Without decorator_filter, both files should appear."""
+        repo, store = self._build_decorator_repo(tmp_path)
+        result = get_blast_radius(
+            repo=repo, symbol="helper", depth=1, storage_path=store
+        )
+        assert "error" not in result
+        confirmed_files = [c["file"] for c in result["confirmed"]]
+        assert any("routes" in f for f in confirmed_files)
+        assert any("service" in f for f in confirmed_files)
+
+
+# ---------------------------------------------------------------------------
+# Per-edge resolution tier tests (Gap 2A)
+# ---------------------------------------------------------------------------
+
+class TestResolutionTiers:
+    """Each call-graph edge must carry a 'resolution' field."""
+
+    def test_callers_have_resolution_field(self, tmp_path):
+        repo, store = _build_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=1, storage_path=store)
+        assert "error" not in result
+        for caller in result["callers"]:
+            assert "resolution" in caller, f"Missing 'resolution' on caller: {caller}"
+            assert caller["resolution"] in ("ast_resolved", "ast_inferred", "text_matched")
+
+    def test_callees_have_resolution_field(self, tmp_path):
+        repo, store = _build_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="process", direction="callees",
+                                    depth=1, storage_path=store)
+        assert "error" not in result
+        for callee in result["callees"]:
+            assert "resolution" in callee, f"Missing 'resolution' on callee: {callee}"
+            assert callee["resolution"] in ("ast_resolved", "ast_inferred", "text_matched")
+
+    def test_meta_includes_resolution_tiers(self, tmp_path):
+        repo, store = _build_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", storage_path=store)
+        assert "error" not in result
+        assert "resolution_tiers" in result["_meta"]
+        tiers = result["_meta"]["resolution_tiers"]
+        assert isinstance(tiers, dict)
+        # At least one tier should have a count > 0
+        assert sum(tiers.values()) > 0
+
+    def test_deep_traversal_preserves_resolution(self, tmp_path):
+        """Resolution field should survive BFS at depth > 1."""
+        repo, store = _build_repo(tmp_path)
+        result = get_call_hierarchy(repo=repo, symbol_id="helper", direction="callers",
+                                    depth=3, storage_path=store)
+        assert "error" not in result
+        for caller in result["callers"]:
+            assert "resolution" in caller

@@ -85,11 +85,22 @@ def test_summarizer(timeout_ms: int = 15000) -> dict[str, Any]:
         return result
 
     if not summarizer:
+        # Map provider to pip extra for actionable install instructions
+        _pip_extras = {
+            "anthropic": "anthropic",
+            "gemini": "gemini",
+            "openai": "openai",
+            "minimax": "minimax",
+            "glm": "zhipu",
+            "openrouter": "openai",
+        }
+        extra = _pip_extras.get(provider, provider)
         result["status"] = "misconfigured"
         result["error"] = (
             f"Provider '{provider}' was detected but the summarizer could not be "
-            "initialized. Check that the required package is installed and the "
-            "API key is valid."
+            f"initialized. The '{extra}' package may not be installed.\n"
+            f"  Run: pip install \"jcodemunch-mcp[{extra}]\"\n"
+            "If the package is already installed, check that the API key is valid."
         )
         return result
 

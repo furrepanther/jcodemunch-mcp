@@ -10,6 +10,7 @@ from typing import Optional
 from ..storage import IndexStore
 from ..parser.imports import resolve_specifier
 from ._utils import resolve_repo
+from ..parser.context._route_utils import ENTRY_POINT_DECORATOR_RE
 
 
 # ---------------------------------------------------------------------------
@@ -31,19 +32,6 @@ _ENTRY_POINT_FILENAMES = frozenset({
     "Makefile",
 })
 
-# Decorator patterns indicating a symbol is an entry point (won't be dead)
-_ENTRY_POINT_DECORATOR_RE = re.compile(
-    r"@(?:app|router|blueprint|api|bp|flask_app)\."
-    r"(?:route|get|post|put|delete|patch|head|options|websocket|before_request|after_request)"
-    r"|@pytest\.fixture"
-    r"|@(?:cli|app)\.command"
-    r"|@(?:celery|huey|dramatiq|rq)\."
-    r"|@task\b"
-    r"|@event_handler\b"
-    r"|@on_event\b",
-    re.IGNORECASE,
-)
-
 _MAIN_GUARD_RE = re.compile(r'if\s+__name__\s*==\s*["\']__main__["\']')
 
 
@@ -60,12 +48,16 @@ def _is_init_file(file_path: str) -> bool:
 def _is_test_file(file_path: str) -> bool:
     fp = file_path.replace("\\", "/")
     fn = fp.rsplit("/", 1)[-1]
+    base = fn.rsplit(".", 1)[0] if "." in fn else fn
     return (
         "/tests/" in fp
         or "/test/" in fp
+        or "/__tests__/" in fp
         or fn.startswith("test_")
         or fn.endswith("_test.py")
         or fn == "conftest.py"
+        or base.endswith(".spec")    # foo.spec.ts, foo.spec.js
+        or base.endswith(".test")    # foo.test.ts, foo.test.js
     )
 
 

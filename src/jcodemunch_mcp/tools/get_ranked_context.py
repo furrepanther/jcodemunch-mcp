@@ -11,11 +11,66 @@ from .search_symbols import (
     _tokenize,
     _compute_bm25,
     _bm25_score,
+    _NEGATIVE_EVIDENCE_THRESHOLD,
     BYTES_PER_TOKEN,
 )
 
 # Weight for PageRank when strategy="combined"
 _PR_WEIGHT = 100.0
+
+# Diversity packing parameters
+_DIVERSITY_DECAY = 0.5       # penalty growth per same-file symbol
+_FILE_GROUP_CAP = 3          # max symbols from a single file
+
+
+def _pack_budget(
+    scored_items: list[tuple[float, dict]],
+    token_budget: int,
+    get_tokens: callable,
+    *,
+    diversity: bool = True,
+) -> tuple[list[tuple[float, dict, str, int]], int]:
+    """Diversity-aware greedy budget packing.
+
+    Args:
+        scored_items: List of (score, sym_dict) sorted by descending score.
+        token_budget: Hard cap on total tokens.
+        get_tokens: Callable(sym) -> (source_str, token_count).
+        diversity: Enable file-diversity penalty (default True).
+
+    Returns:
+        (packed, total_tokens) where packed is list of
+        (adjusted_score, sym, source, item_tokens).
+    """
+    packed: list[tuple[float, dict, str, int]] = []
+    total_tokens = 0
+    file_counts: dict[str, int] = {}
+
+    for score, sym in scored_items:
+        sym_file = sym.get("file", "")
+
+        # Diversity: enforce per-file cap
+        if diversity and file_counts.get(sym_file, 0) >= _FILE_GROUP_CAP:
+            continue
+
+        source, item_tokens = get_tokens(sym)
+        if item_tokens == 0:
+            continue
+        if total_tokens + item_tokens > token_budget:
+            continue
+
+        # Diversity: decay score for repeated files
+        if diversity:
+            n = file_counts.get(sym_file, 0)
+            adjusted = score * (_DIVERSITY_DECAY ** n)
+        else:
+            adjusted = score
+
+        packed.append((adjusted, sym, source, item_tokens))
+        total_tokens += item_tokens
+        file_counts[sym_file] = file_counts.get(sym_file, 0) + 1
+
+    return packed, total_tokens
 
 
 def get_ranked_context(
@@ -25,6 +80,7 @@ def get_ranked_context(
     strategy: str = "combined",
     include_kinds: Optional[list] = None,
     scope: Optional[str] = None,
+    fusion: bool = False,
     storage_path: Optional[str] = None,
 ) -> dict:
     """Assemble the best-fit context for a query within a token budget.
@@ -44,6 +100,8 @@ def get_ranked_context(
         include_kinds: Optional list of symbol kinds to restrict results to
             (e.g. ['class', 'function']).
         scope: Optional subdirectory glob to limit search (e.g. 'src/core/*').
+        fusion: Enable multi-signal fusion (Weighted Reciprocal Rank) for
+            ranking. When True, ``strategy`` maps to channel weight presets.
         storage_path: Custom storage path.
 
     Returns:
@@ -73,6 +131,8 @@ def get_ranked_context(
 
     # BM25 corpus — cached on CodeIndex
     query_terms = _tokenize(query) or [query.lower()]
+    # Guard: empty string in query_terms causes "" to match every filename
+    query_terms = [t for t in query_terms if t]
     cache = index._bm25_cache
     if "idf" not in cache:
         from .search_symbols import _compute_centrality  # noqa: PLC0415
@@ -92,6 +152,24 @@ def get_ranked_context(
             )
             cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
+
+    # ── Fusion path ─────────────────────────────────────────────────────
+    if fusion:
+        return _get_ranked_context_fusion(
+            index=index,
+            store=store,
+            owner=owner,
+            name=name,
+            query=query,
+            query_terms=query_terms,
+            idf=idf,
+            avgdl=avgdl,
+            pagerank=pagerank,
+            token_budget=token_budget,
+            include_kinds=include_kinds,
+            scope=scope,
+            start=start,
+        )
 
     # Normalize PageRank to [0,1] for score combination
     max_pr = max(pagerank.values()) if pagerank else 1.0
@@ -129,18 +207,38 @@ def get_ranked_context(
 
     if not raw_scores:
         elapsed = (time.perf_counter() - start) * 1000
-        return {
+        # Negative evidence: signal that nothing matched
+        related_existing = [
+            f for f in index.source_files
+            if any(t in f.lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                   for t in query_terms)
+        ][:5]
+        ne = {
+            "verdict": "no_implementation_found",
+            "scanned_symbols": len(candidates),
+            "scanned_files": len(index.source_files),
+            "best_match_score": 0.0,
+        }
+        if related_existing:
+            ne["related_existing"] = related_existing
+        result = {
             "context_items": [],
             "total_tokens": 0,
             "budget_tokens": token_budget,
             "items_included": 0,
             "items_considered": 0,
+            "negative_evidence": ne,
+            "\u26a0 warning": (
+                f"No implementation found for '{query[:80]}'. "
+                f"Do not claim this feature exists."
+            ),
             "_meta": {
                 "timing_ms": round(elapsed, 1),
                 "tokens_saved": 0,
                 "total_tokens_saved": 0,
             },
         }
+        return result
 
     # Normalize and compute combined score
     norm_bm25_denom = max_bm25 if max_bm25 > 0 else 1.0
@@ -159,26 +257,65 @@ def get_ranked_context(
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Greedy pack: load source and accumulate until budget exhausted
-    context_items: list[dict] = []
-    total_tokens = 0
     items_considered = len(scored)
 
+    # Build score lookup for BM25/PR per symbol
+    _score_lookup: dict[str, tuple[float, float]] = {}
     for combined_score, bm25_norm, pr_norm, sym in scored:
-        source = store.get_symbol_content(owner, name, sym["id"], _index=index) or ""
-        item_tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
-        if total_tokens + item_tokens > token_budget:
-            continue  # skip symbols that don't fit; keep trying smaller ones
+        _score_lookup[sym["id"]] = (bm25_norm, pr_norm)
 
+    def _get_tokens(sym):
+        source = store.get_symbol_content(owner, name, sym["id"], _index=index) or ""
+        tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
+        return source, tokens
+
+    packed, total_tokens = _pack_budget(
+        [(combined_score, sym) for combined_score, _, _, sym in scored],
+        token_budget,
+        _get_tokens,
+    )
+
+    context_items: list[dict] = []
+    for adj_score, sym, source, item_tokens in packed:
+        bm25_norm, pr_norm = _score_lookup.get(sym["id"], (0.0, 0.0))
         context_items.append({
             "symbol_id": sym["id"],
             "relevance_score": round(bm25_norm, 4),
             "centrality_score": round(pr_norm, 4),
-            "combined_score": round(combined_score, 4),
+            "combined_score": round(adj_score, 4),
             "tokens": item_tokens,
             "source": source,
         })
-        total_tokens += item_tokens
+
+    # Negative evidence for low-confidence or empty results
+    _ne_threshold = _NEGATIVE_EVIDENCE_THRESHOLD
+    try:
+        from .. import config as _cfg
+        _ne_threshold = _cfg.get("negative_evidence_threshold", _NEGATIVE_EVIDENCE_THRESHOLD)
+    except Exception:
+        pass
+
+    negative_evidence = None
+    # For semantic-only mode, BM25 score can legitimately be 0 even with valid
+    # semantic matches — skip the max_bm25 threshold check to avoid false negatives.
+    _check_bm25_threshold = True  # will be overridden below for semantic_only
+    if strategy == "semantic_only":
+        _check_bm25_threshold = False
+    if not context_items or (_check_bm25_threshold and max_bm25 < _ne_threshold):
+        verdict = "no_implementation_found" if not context_items else "low_confidence_matches"
+        related_existing = [
+            f for f in index.source_files
+            if any(t in f.lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                   for t in query_terms)
+        ][:5]
+        negative_evidence = {
+            "verdict": verdict,
+            "scanned_symbols": items_considered,
+            "scanned_files": len(set(s.get("file", "") for _, _, _, s in scored)),
+            "best_match_score": round(max_bm25, 3),
+        }
+        if related_existing:
+            negative_evidence["related_existing"] = related_existing
 
     # Token savings estimate
     raw_bytes = sum(
@@ -191,7 +328,7 @@ def get_ranked_context(
 
     elapsed = (time.perf_counter() - start) * 1000
 
-    return {
+    result = {
         "context_items": context_items,
         "total_tokens": total_tokens,
         "budget_tokens": token_budget,
@@ -202,5 +339,149 @@ def get_ranked_context(
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
             **_cost_avoided(tokens_saved, total_saved),
+        },
+    }
+    if negative_evidence is not None:
+        result["negative_evidence"] = negative_evidence
+        if negative_evidence["verdict"] == "no_implementation_found":
+            result["\u26a0 warning"] = (
+                f"No implementation found for '{query[:80]}'. "
+                f"Do not claim this feature exists."
+            )
+        else:
+            result["\u26a0 warning"] = (
+                f"Low-confidence matches for '{query[:80]}' "
+                f"(best score: {negative_evidence['best_match_score']}). "
+                f"Verify before claiming this feature exists."
+            )
+    return result
+
+
+def _get_ranked_context_fusion(
+    *,
+    index,
+    store,
+    owner: str,
+    name: str,
+    query: str,
+    query_terms: list[str],
+    idf: dict,
+    avgdl: float,
+    pagerank: dict,
+    token_budget: int,
+    include_kinds,
+    scope,
+    start: float,
+) -> dict:
+    """Fusion-based ranked context: WRR across channels, greedy budget packing."""
+    from ..retrieval.signal_fusion import (
+        fuse,
+        build_lexical_channel,
+        build_structural_channel,
+        build_identity_channel,
+        load_fusion_weights,
+    )
+    from .search_symbols import _compute_centrality
+
+    # Filter candidates
+    candidates = index.symbols
+    if include_kinds or scope:
+        candidates = [
+            sym for sym in candidates
+            if (not include_kinds or sym.get("kind") in include_kinds)
+            and (not scope or fnmatch(sym.get("file", ""), scope))
+        ]
+
+    if not candidates:
+        elapsed = (time.perf_counter() - start) * 1000
+        return {
+            "context_items": [],
+            "total_tokens": 0,
+            "budget_tokens": token_budget,
+            "items_included": 0,
+            "items_considered": 0,
+            "_meta": {"timing_ms": round(elapsed, 1), "tokens_saved": 0, "total_tokens_saved": 0},
+        }
+
+    # Centrality for BM25 tiebreaker
+    cache = index._bm25_cache
+    if "centrality" not in cache:
+        cache["centrality"] = _compute_centrality(
+            index.symbols, index.imports, index.alias_map,
+            getattr(index, "psr4_map", None),
+        )
+    centrality = cache["centrality"]
+
+    weights, smoothing = load_fusion_weights()
+
+    channels = []
+    lex_ch = build_lexical_channel(candidates, query_terms, idf, avgdl, centrality)
+    channels.append(lex_ch)
+
+    id_ch = build_identity_channel(candidates, query)
+    channels.append(id_ch)
+
+    if pagerank:
+        candidate_ids = set(lex_ch.ranked_ids) | set(id_ch.ranked_ids)
+        struct_ch = build_structural_channel(candidates, pagerank, candidate_ids)
+        channels.append(struct_ch)
+
+    fused = fuse(channels, smoothing=smoothing, weights=weights)
+
+    # Diversity-aware budget packing
+    sym_by_id = {sym["id"]: sym for sym in candidates}
+
+    # Build fused score lookup for channel contributions
+    _fused_lookup: dict[str, object] = {fr.symbol_id: fr for fr in fused}
+
+    # Filter to valid symbols and pass to packer
+    fused_scored = []
+    for fr in fused:
+        sym = sym_by_id.get(fr.symbol_id)
+        if sym:
+            fused_scored.append((fr.score, sym))
+
+    def _get_tokens_fusion(sym):
+        source = store.get_symbol_content(owner, name, sym["id"], _index=index) or ""
+        tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
+        return source, tokens
+
+    packed, total_tokens = _pack_budget(
+        fused_scored, token_budget, _get_tokens_fusion,
+    )
+
+    context_items = []
+    for adj_score, sym, source, item_tokens in packed:
+        fr = _fused_lookup.get(sym["id"])
+        context_items.append({
+            "symbol_id": sym["id"],
+            "fusion_score": round(adj_score, 6),
+            "channels": {k: round(v, 6) for k, v in fr.channel_contributions.items()} if fr else {},
+            "tokens": item_tokens,
+            "source": source,
+        })
+
+    raw_bytes = sum(
+        index.file_sizes.get(sym.get("file", ""), 0)
+        for _, sym, _, _ in packed
+    )
+    response_bytes = total_tokens * BYTES_PER_TOKEN
+    tokens_saved = estimate_savings(raw_bytes, response_bytes)
+    total_saved = record_savings(tokens_saved, tool_name="get_ranked_context")
+    elapsed = (time.perf_counter() - start) * 1000
+
+    return {
+        "context_items": context_items,
+        "total_tokens": total_tokens,
+        "budget_tokens": token_budget,
+        "items_included": len(context_items),
+        "items_considered": len(fused),
+        "_meta": {
+            "timing_ms": round(elapsed, 1),
+            "tokens_saved": tokens_saved,
+            "total_tokens_saved": total_saved,
+            **_cost_avoided(tokens_saved, total_saved),
+            "fusion": True,
+            "channels": [ch.name for ch in channels],
         },
     }

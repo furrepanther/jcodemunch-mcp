@@ -87,15 +87,32 @@ jcodemunch-mcp/
 │   ├── cli.py
 │   └── README.md
 ├── src/jcodemunch_mcp/
-│   ├── server.py
-│   ├── security.py
-│   ├── hook_event.py
+│   ├── server.py              # MCP dispatcher, auth/rate-limit, tool routing
+│   ├── config.py              # JSONC config: global + per-project layering
+│   ├── security.py            # Path validation, skip patterns, file caps
+│   ├── agent_selector.py      # Complexity scoring + model routing (off/manual/auto)
+│   ├── hook_event.py          # Worktree lifecycle event recording
+│   ├── reindex_state.py       # Per-repo reindex generation tracking
+│   ├── watcher.py             # File system watcher for auto-reindex
+│   ├── cli/
+│   │   ├── init.py            # `jcodemunch-mcp init` — one-command onboarding
+│   │   └── hooks.py           # PreToolUse, PostToolUse, PreCompact hook handlers
 │   ├── parser/
+│   │   ├── languages.py       # LANGUAGE_REGISTRY, extension → language map
+│   │   ├── extractor.py       # parse_file() dispatch; custom parsers
+│   │   ├── imports.py         # Regex import extraction (19+ languages)
+│   │   └── fqn.py             # PHP FQN ↔ symbol_id translation (PSR-4)
 │   ├── storage/
 │   │   ├── index_store.py
 │   │   └── sqlite_store.py
 │   ├── summarizer/
 │   ├── tools/
+│   │   ├── _call_graph.py     # AST-derived call-graph helpers
+│   │   ├── session_journal.py # Process-lifetime session tracking
+│   │   ├── session_state.py   # Session save/restore across restarts
+│   │   ├── turn_budget.py     # Cross-call token accumulator
+│   │   ├── plan_turn.py       # Opening-move router (BM25 + PageRank)
+│   │   └── ...
 │   └── ...
 ├── tests/
 └── .github/workflows/
@@ -478,6 +495,7 @@ The tool surface is best described by capability domain rather than by a fixed c
 * `get_file_content`
 * `get_symbol_source`
 * `get_context_bundle`
+* `get_ranked_context` — query-driven token-budgeted context assembly (BM25 + PageRank)
 
 ### Search and reference checking
 
@@ -493,12 +511,36 @@ The tool surface is best described by capability domain rather than by a fixed c
 * `get_dependency_graph`
 * `get_related_symbols`
 * `get_class_hierarchy`
-* `get_blast_radius`
+* `get_blast_radius` — includes `include_source`, `source_budget`, `decorator_filter` params
 * `get_symbol_diff`
+* `get_call_hierarchy` — callers/callees N levels deep (AST-derived on v8+ indexes)
+* `get_impact_preview` — transitive downstream impact analysis
+* `get_hotspots` — complexity × churn ranking
+* `get_coupling_metrics` — afferent/efferent coupling and instability
+* `get_dependency_cycles` — circular dependency detection
+* `get_extraction_candidates` — refactoring suggestions based on complexity and caller count
+* `find_dead_code` — import-graph reachability from entry points
+* `get_dead_code_v2` — multi-signal dead code detection with framework awareness
+* `get_changed_symbols` — git diff to affected symbols mapping
+* `get_symbol_importance` — PageRank centrality ranking
+* `get_symbol_complexity` — cyclomatic/nesting/param metrics
 
 ### Batch query support
 
 Several tools accept array parameters alongside their singular equivalents, enabling multiple queries in a single call. This reduces LLM round-trips and cache re-reads. Singular parameters continue to return the original flat response shape for backward compatibility. Batch mode returns a grouped `results` array. Response-level `tip` fields in `_meta` guide models toward batch usage without requiring external configuration.
+
+### Session and routing
+
+* `plan_turn` — opening-move router (BM25 + PageRank confidence assessment)
+* `get_session_context` — session history (reads, searches, edits, tool calls)
+* `get_session_snapshot` — compact session state for context injection after compaction
+* `register_edit` — post-edit cache invalidation (BM25, search result caches)
+* `get_session_stats` — token savings, cost avoided, per-tool breakdown
+
+### Agent config and indexing hygiene
+
+* `audit_agent_config` — scan CLAUDE.md, .cursorrules, etc. for token waste and stale references
+* `embed_repo` — precompute all symbol embeddings for semantic search
 
 ### Domain-specific retrieval
 

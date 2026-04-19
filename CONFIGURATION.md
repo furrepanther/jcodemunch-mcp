@@ -56,6 +56,8 @@ jcodemunch-mcp config --check
 | `summarizer_concurrency` | int | `4` | Parallel batch requests to the AI summarizer. |
 | `allow_remote_summarizer` | bool | `false` | Allow remote AI summarizer even when local LLM is configured. |
 | `extra_ignore_patterns` | list | `[]` | Additional gitignore-style patterns to exclude from indexing. Merged with per-call patterns. |
+| `exclude_skip_directories` | list | `[]` | Remove entries from the built-in skip directory list. Example: `["proto"]` to index protobuf dirs skipped by default. |
+| `exclude_secret_patterns` | list | `[]` | Remove entries from the built-in secret-file skip patterns. |
 | `extra_extensions` | dict | `{}` | Map file extensions to language names (e.g. `{".jsx": "javascript"}`). Extends the built-in extension map. |
 | `context_providers` | bool | `true` | Enable context providers (dbt model detection, etc.) during indexing. |
 | `staleness_days` | int | `7` | Days before `get_repo_outline` emits a staleness warning for remote repos. |
@@ -68,6 +70,7 @@ Controls which languages are parsed during indexing. When set, only listed langu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `languages` | list or null | `null` | Language filter. `null` = all languages enabled. Set to a list to restrict. |
+| `languages_adaptive` | bool | `false` | Automatically adjust the `languages` list based on detected languages during indexing. |
 
 **Example — Python-only project:**
 
@@ -226,6 +229,62 @@ Semantic/embedding search is opt-in and requires no config file changes — it i
 When no provider is configured, `search_symbols(semantic=true)` returns a structured error (`error: "no_embedding_provider"`) rather than crashing.
 
 Embeddings are stored in the per-repo SQLite database (`symbol_embeddings` table). They persist across restarts and are invalidated only for changed symbols on incremental reindex.
+
+### Session awareness
+
+Controls the session-aware routing features (plan_turn, session journal, turn budget).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `session_journal` | bool | `true` | Enable session journal (tracks reads, searches, edits, tool calls). |
+| `turn_budget_tokens` | int | `20000` | Token budget per turn. Injects `budget_warning` when exceeded. `0` = disabled. |
+| `turn_gap_seconds` | float | `30.0` | Seconds of inactivity before starting a new turn budget cycle. |
+| `negative_evidence_threshold` | float | `0.5` | BM25 score threshold below which results are flagged as negative evidence. |
+| `search_result_cache_max` | int | `128` | Max entries in the LRU search result cache. |
+| `plan_turn_high_threshold` | float | `2.0` | BM25 score threshold for "high" confidence in `plan_turn`. |
+| `plan_turn_medium_threshold` | float | `0.5` | BM25 score threshold for "medium" confidence in `plan_turn`. |
+| `session_resume` | bool | `false` | Opt-in: persist session state across restarts via atexit save/restore. |
+| `session_max_age_minutes` | int | `30` | Max age of a persisted session before it's considered stale. |
+| `session_max_queries` | int | `50` | Max queries in a persisted session before rotation. |
+| `discovery_hint` | bool | `true` | Show discovery hints in tool responses for first-time users. |
+
+### Agent Selector
+
+Opt-in complexity-based model routing. Off by default — zero behavioral change.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `agent_selector` | dict | `{}` | Agent selector configuration block. See below for sub-keys. |
+
+**Sub-keys within `agent_selector`:**
+
+| Sub-key | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mode` | str | `"off"` | `"off"` (disabled), `"manual"` (advisory prompts), or `"auto"` (automatic routing). |
+| `activeProvider` | str | `"anthropic"` | Which provider's batting order to use. Must match a key in `providers` or a built-in default. |
+| `providers` | dict | (built-in) | Custom model tiers per provider. Format: `{"anthropic": {"low": "...", "medium": "...", "high": "..."}}`. |
+| `thresholds` | dict | `{"lowCeiling": 25, "highFloor": 70}` | Complexity score boundaries for tier assignment (0-100 scale). |
+| `verbosePrompts` | bool | `false` | In manual mode, also prompt on step-down opportunities (not just step-up). |
+
+**Example:**
+
+```jsonc
+{
+  "agent_selector": {
+    "mode": "manual",
+    "activeProvider": "anthropic",
+    "verbosePrompts": false
+  }
+}
+```
+
+Built-in default batting orders: Anthropic (`haiku` / `sonnet` / `opus`), OpenAI (`gpt-4o-mini` / `gpt-4o` / `o3`), Google (`flash` / `pro` / `pro`).
+
+### Freshness
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `strict_timeout_ms` | int | `500` | In `freshness_mode: "strict"`, max ms to wait for an in-progress reindex before serving. |
 
 ### Path remapping
 

@@ -21,7 +21,7 @@ async def test_server_lists_all_tools():
     try:
         tools = await list_tools()
 
-        assert len(tools) == 45
+        assert len(tools) == 61  # 59 + set_tool_tier + announce_model
 
         names = {t.name for t in tools}
         expected = {
@@ -29,7 +29,8 @@ async def test_server_lists_all_tools():
             "get_file_tree", "get_file_outline", "get_file_content", "get_symbol_source",
             "search_symbols", "invalidate_cache", "search_text", "get_repo_outline",
             "find_importers", "find_references", "check_references", "search_columns", "get_context_bundle",
-            "get_session_stats", "get_dependency_graph", "get_blast_radius",
+            "get_session_stats", "get_session_context", "get_session_snapshot", "plan_turn", "register_edit",
+            "get_dependency_graph", "get_blast_radius",
             "get_symbol_diff", "get_class_hierarchy", "get_related_symbols", "suggest_queries",
             "get_symbol_importance", "find_dead_code",
             "get_changed_symbols", "get_ranked_context", "embed_repo",
@@ -37,8 +38,14 @@ async def test_server_lists_all_tools():
             "get_call_hierarchy", "get_impact_preview",
             "get_dependency_cycles", "get_coupling_metrics", "get_layer_violations",
             "check_rename_safe", "get_dead_code_v2", "get_extraction_candidates",
+            "plan_refactoring",
             "get_symbol_complexity", "get_churn_rate", "get_hotspots", "get_repo_health",
-            "audit_agent_config",
+            "audit_agent_config", "get_untested_symbols", "search_ast",
+            "get_tectonic_map", "get_signal_chains", "render_diagram",
+            "get_project_intel",
+            "get_symbol_provenance", "get_pr_risk_profile",
+            "winnow_symbols",
+            "set_tool_tier", "announce_model",
         }
         assert names == expected
         assert "test_summarizer" not in names  # disabled by default in DEFAULTS
@@ -123,6 +130,7 @@ async def test_call_tool_defaults_index_repo_incremental_true():
         storage_path=None,
         incremental=True,
         extra_ignore_patterns=None,
+        progress_cb=None,
     )
 
 
@@ -139,6 +147,7 @@ async def test_call_tool_defaults_index_folder_incremental_true():
         extra_ignore_patterns=None,
         follow_symlinks=False,
         incremental=True,
+        progress_cb=None,
     )
 
 
@@ -378,14 +387,15 @@ async def test_call_tool_validation_error_returns_json_error():
 
 @pytest.mark.asyncio
 async def test_call_tool_unexpected_coerce_error_returns_json():
-    """Unexpected errors return a generic message — raw exception text must not leak to clients."""
+    """Unexpected errors return a generic error plus a short client-facing summary."""
     with patch("jcodemunch_mcp.server._ensure_tool_schemas", side_effect=RuntimeError("boom")):
         result = await call_tool("index_folder", {"path": "/tmp"})
 
     assert len(result) == 1
     payload = json.loads(result[0].text)
     assert "error" in payload
-    # Raw exception message must NOT appear in the client response (S3 hardening)
+    assert payload["summary"] == "RuntimeError: boom"
+    # The top-level error stays generic even when the summary is exposed.
     assert "boom" not in payload["error"]
     assert "index_folder" in payload["error"]
 
@@ -655,8 +665,9 @@ async def test_disabled_tools_filtered_from_schema(monkeypatch):
         assert "index_repo" not in tool_names
         assert "search_columns" not in tool_names
         assert "get_file_tree" in tool_names  # Not disabled
-        # 45 total tools - 2 explicitly disabled = 43
-        assert len(tools) == 44
+        # 61 default tools (59 + 2 runtime) + test_summarizer (config cleared) - 2 disabled = 60
+        # But set_tool_tier + announce_model are force-included even when disabled
+        assert len(tools) == 60
     finally:
         config_module._GLOBAL_CONFIG.clear()
         config_module._GLOBAL_CONFIG.update(orig_config)
@@ -664,7 +675,7 @@ async def test_disabled_tools_filtered_from_schema(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_disabled_tools_empty_all_tools_present(monkeypatch):
-    """When disabled_tools is empty, all 38 tools are present."""
+    """When disabled_tools is empty, all 60 tools are present."""
     from jcodemunch_mcp import config as config_module
 
     orig_config = config_module._GLOBAL_CONFIG.copy()
@@ -674,7 +685,7 @@ async def test_disabled_tools_empty_all_tools_present(monkeypatch):
         config_module._GLOBAL_CONFIG["disabled_tools"] = []
 
         tools = await list_tools()
-        assert len(tools) == 46
+        assert len(tools) == 62  # 60 + set_tool_tier + announce_model
     finally:
         config_module._GLOBAL_CONFIG.clear()
         config_module._GLOBAL_CONFIG.update(orig_config)
@@ -944,3 +955,354 @@ async def test_project_tool_disabled_rejected_in_call_tool():
         config_module._GLOBAL_CONFIG.update(orig_global)
         config_module._PROJECT_CONFIGS.clear()
         config_module._PROJECT_CONFIGS.update(orig_project)
+
+
+# --------------------------------------------------------------------------- #
+# Tool profiles                                                                #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_tool_profile_core():
+    """Core profile should only expose ~16 essential tools."""
+    from jcodemunch_mcp import config as config_module
+    from jcodemunch_mcp.server import _TOOL_TIER_CORE
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["tool_profile"] = "core"
+    config_module._GLOBAL_CONFIG["disabled_tools"] = []
+
+    try:
+        tools = await list_tools()
+        names = {t.name for t in tools}
+        # Core tier + the two always-present runtime tools
+        assert names == _TOOL_TIER_CORE | {"set_tool_tier", "announce_model"}
+        # Core must include the essentials
+        for essential in ("search_symbols", "get_symbol_source", "list_repos",
+                          "get_file_tree", "index_folder"):
+            assert essential in names, f"{essential} missing from core profile"
+        # Core must NOT include advanced tools
+        for excluded in ("plan_refactoring", "get_hotspots", "audit_agent_config",
+                         "get_session_stats", "plan_turn"):
+            assert excluded not in names, f"{excluded} should not be in core profile"
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+@pytest.mark.asyncio
+async def test_tool_profile_standard():
+    """Standard profile should include core + analytics but not refactoring/session."""
+    from jcodemunch_mcp import config as config_module
+    from jcodemunch_mcp.server import _TOOL_TIER_STANDARD
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["tool_profile"] = "standard"
+    config_module._GLOBAL_CONFIG["disabled_tools"] = []
+
+    try:
+        tools = await list_tools()
+        names = {t.name for t in tools}
+        # Standard tier + the two always-present runtime tools
+        assert names == _TOOL_TIER_STANDARD | {"set_tool_tier", "announce_model"}
+        # Standard includes analytics
+        assert "get_hotspots" in names
+        assert "get_blast_radius" in names
+        # Standard excludes power-user tools
+        assert "plan_refactoring" not in names
+        assert "get_session_stats" not in names
+        assert "audit_agent_config" not in names
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+@pytest.mark.asyncio
+async def test_tool_profile_full_is_default():
+    """Full profile (default) should expose all tools minus disabled."""
+    from jcodemunch_mcp import config as config_module
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+
+    try:
+        tools = await list_tools()
+        names = {t.name for t in tools}
+        # Full profile includes everything except default-disabled test_summarizer
+        assert "plan_refactoring" in names
+        assert "get_session_stats" in names
+        assert "audit_agent_config" in names
+        assert "test_summarizer" not in names  # disabled by default, not by profile
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+@pytest.mark.asyncio
+async def test_tool_profile_combined_with_disabled_tools():
+    """Profile + disabled_tools should stack: profile filters first, then disabled."""
+    from jcodemunch_mcp import config as config_module
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["tool_profile"] = "core"
+    config_module._GLOBAL_CONFIG["disabled_tools"] = ["search_text"]
+
+    try:
+        tools = await list_tools()
+        names = {t.name for t in tools}
+        assert "search_text" not in names
+        assert "search_symbols" in names
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+# --------------------------------------------------------------------------- #
+# Compact schemas                                                              #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_compact_schemas_strips_advanced_params():
+    """compact_schemas should remove advanced params from search_symbols schema."""
+    from jcodemunch_mcp import config as config_module
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["compact_schemas"] = True
+    config_module._GLOBAL_CONFIG["disabled_tools"] = []
+
+    try:
+        tools = await list_tools()
+        search = next(t for t in tools if t.name == "search_symbols")
+        props = search.inputSchema["properties"]
+        # Core params still present
+        assert "repo" in props
+        assert "query" in props
+        assert "kind" in props
+        assert "max_results" in props
+        # Advanced params stripped
+        assert "debug" not in props
+        assert "fusion" not in props
+        assert "semantic" not in props
+        assert "semantic_only" not in props
+        assert "fuzzy" not in props
+        assert "fuzzy_threshold" not in props
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+@pytest.mark.asyncio
+async def test_compact_schemas_off_preserves_all_params():
+    """When compact_schemas is off (default), all params remain."""
+    from jcodemunch_mcp import config as config_module
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["disabled_tools"] = []
+
+    try:
+        tools = await list_tools()
+        search = next(t for t in tools if t.name == "search_symbols")
+        props = search.inputSchema["properties"]
+        assert "debug" in props
+        assert "fusion" in props
+        assert "semantic" in props
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+# --------------------------------------------------------------------------- #
+# Tool tier bundles + model tier map                                           #
+# --------------------------------------------------------------------------- #
+
+def test_tool_tier_bundles_default_present():
+    """DEFAULTS must ship with tool_tier_bundles pre-populated for core and standard."""
+    from jcodemunch_mcp.config import DEFAULTS
+
+    bundles = DEFAULTS["tool_tier_bundles"]
+    assert isinstance(bundles, dict)
+    assert "core" in bundles and "standard" in bundles
+    assert isinstance(bundles["core"], list)
+    assert isinstance(bundles["standard"], list)
+    assert "search_symbols" in bundles["core"]
+    assert "get_context_bundle" in bundles["core"]
+    assert "index_folder" in bundles["core"]
+    core_set = set(bundles["core"])
+    std_set = set(bundles["standard"])
+    assert core_set.issubset(std_set), "standard must include all core tools"
+
+
+def test_model_tier_map_default_present():
+    from jcodemunch_mcp.config import DEFAULTS
+
+    mp = DEFAULTS["model_tier_map"]
+    assert isinstance(mp, dict)
+    assert mp["claude-opus"] == "full"
+    assert mp["claude-sonnet"] == "standard"
+    assert mp["claude-haiku"] == "core"
+    assert mp["*"] == "full"
+
+
+def test_adaptive_tiering_defaults_false():
+    from jcodemunch_mcp.config import DEFAULTS
+    assert DEFAULTS["adaptive_tiering"] is False
+
+
+def test_adaptive_tiering_in_config_types():
+    from jcodemunch_mcp.config import CONFIG_TYPES
+    assert CONFIG_TYPES["adaptive_tiering"] is bool
+
+
+def test_generate_template_includes_tier_bundles_and_model_map():
+    """Template must emit active, uncommented tool_tier_bundles and model_tier_map blocks."""
+    from jcodemunch_mcp.config import generate_template
+
+    text = generate_template()
+    assert '"tool_tier_bundles"' in text
+    assert '"model_tier_map"' in text
+    assert '"core"' in text
+    assert '"claude-opus"' in text
+    assert "disabled_tools applies AFTER tier filtering" in text
+
+
+def test_generate_template_includes_adaptive_tiering():
+    from jcodemunch_mcp.config import generate_template
+    text = generate_template()
+    assert '"adaptive_tiering"' in text
+    assert "opt-in" in text.lower()
+
+
+def test_generate_template_disabled_tools_reference_includes_runtime_switch_tools():
+    from jcodemunch_mcp.config import generate_template
+
+    text = generate_template()
+    assert '// "set_tool_tier",' in text
+    assert '// "announce_model",' in text
+
+
+def test_upgrade_config_adds_tier_bundle_keys(tmp_path):
+    """upgrade_config must append tool_tier_bundles and model_tier_map to old configs."""
+    from pathlib import Path
+    from jcodemunch_mcp.config import upgrade_config
+
+    old_config = tmp_path / "config.jsonc"
+    old_config.write_text(
+        '{\n'
+        '  "tool_profile": "full",\n'
+        '  "disabled_tools": ["test_summarizer"]\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    upgrade_config(old_config)
+    new_text = old_config.read_text(encoding="utf-8")
+    assert "tool_tier_bundles" in new_text
+    assert "model_tier_map" in new_text
+    assert '"tool_profile": "full"' in new_text
+    assert '"test_summarizer"' in new_text
+
+
+def test_upgrade_config_adds_adaptive_tiering(tmp_path):
+    from pathlib import Path
+    from jcodemunch_mcp.config import upgrade_config
+    old = tmp_path / "config.jsonc"
+    old.write_text('{"tool_profile": "full"}\n', encoding="utf-8")
+    upgrade_config(old)
+    assert "adaptive_tiering" in old.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_tool_tier_bundles_config_override():
+    """Editing tool_tier_bundles.core in config must change tools/list output."""
+    import jcodemunch_mcp.config as config_module
+    from copy import deepcopy
+
+    orig_config = config_module._GLOBAL_CONFIG.copy()
+    config_module._GLOBAL_CONFIG.clear()
+    config_module._GLOBAL_CONFIG.update(deepcopy(config_module.DEFAULTS))
+    config_module._GLOBAL_CONFIG["tool_profile"] = "core"
+    config_module._GLOBAL_CONFIG["disabled_tools"] = []
+    # Override core bundle to only have search_symbols
+    config_module._GLOBAL_CONFIG["tool_tier_bundles"]["core"] = ["search_symbols"]
+
+    try:
+        from jcodemunch_mcp.server import _build_tools_list
+        tools = await list_tools()
+        names = {t.name for t in tools}
+        assert "search_symbols" in names
+        # index_folder was in baked-in core but not in our overridden core.
+        assert "index_folder" not in names
+        assert "get_context_bundle" not in names
+    finally:
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._GLOBAL_CONFIG.update(orig_config)
+
+
+def test_all_canonical_tools_accounted_in_tier_bundles():
+    """Every tool in _CANONICAL_TOOL_NAMES must appear in at least one tier bundle
+    (core or standard) or be explicitly listed as a known full-tier-only tool.
+
+    This test fails when a new tool is added to the server but not placed in
+    any tier bundle — forcing the developer to consciously decide which tier
+    it belongs to.
+    """
+    from jcodemunch_mcp.server import _CANONICAL_TOOL_NAMES
+    from jcodemunch_mcp.config import DEFAULTS
+
+    bundles = DEFAULTS["tool_tier_bundles"]
+    core_set = set(bundles.get("core", []))
+    std_set = set(bundles.get("standard", []))
+    bundled = core_set | std_set
+
+    # Tools that are intentionally full-tier-only (not in core or standard).
+    # When adding a new tool, either put it in a bundle OR add it here with
+    # a comment explaining why it's full-only.
+    known_full_only = {
+        # Power-user refactoring / session tools
+        "plan_refactoring",
+        "audit_agent_config",
+        "get_extraction_candidates",
+        # Session state tools (rarely needed in constrained tiers)
+        "get_session_stats",
+        "get_session_context",
+        "get_session_snapshot",
+        # Diagnostic / write tools
+        "test_summarizer",
+        "register_edit",
+        # Runtime tier-switching tools (force-included regardless of tier)
+        "set_tool_tier",
+        "announce_model",
+        # Core planning tool (too expensive for core tier)
+        "plan_turn",
+    }
+
+    canonical = set(_CANONICAL_TOOL_NAMES)
+    unaccounted = canonical - bundled - known_full_only
+
+    assert not unaccounted, (
+        f"Tools missing from tier bundles and not in known_full_only: {unaccounted}. "
+        f"Add each to tool_tier_bundles.core/standard in config.py DEFAULTS, "
+        f"or add to known_full_only in this test with an explanation."
+    )
+
+    # Also verify no known_full_only tool is actually in a bundle (stale entry)
+    stale = known_full_only & bundled
+    assert not stale, (
+        f"Tools in known_full_only but also in a tier bundle (stale): {stale}. "
+        f"Remove them from known_full_only in this test."
+    )

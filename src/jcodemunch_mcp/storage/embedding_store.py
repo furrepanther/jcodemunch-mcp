@@ -145,6 +145,21 @@ class EmbeddingStore:
             logger.debug("EmbeddingStore.get failed for %s", symbol_id, exc_info=True)
             return None
 
+    def get_all_ids(self) -> set[str]:
+        """Return the set of symbol IDs that have stored embeddings."""
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT symbol_id FROM symbol_embeddings"
+                ).fetchall()
+                return {row[0] for row in rows}
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("EmbeddingStore.get_all_ids failed", exc_info=True)
+            return set()
+
     def get_all(self) -> dict[str, list[float]]:
         """Return every stored embedding as {symbol_id: vector}."""
         try:

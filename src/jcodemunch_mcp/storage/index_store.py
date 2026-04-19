@@ -21,7 +21,7 @@ from .sqlite_store import SQLiteIndexStore, _VERIFIED_PATHS
 logger = logging.getLogger(__name__)
 
 # Bump this when the index schema changes in an incompatible way.
-INDEX_VERSION = 7
+INDEX_VERSION = 9
 
 
 @functools.lru_cache(maxsize=16)
@@ -67,6 +67,31 @@ def _get_git_head(repo_path: Path) -> Optional[str]:
     return None
 
 
+def _get_git_branch(repo_path: Path) -> Optional[str]:
+    """Get current branch name for a git repo, or None.
+
+    Returns the symbolic branch name (e.g. "main", "feature/foo").
+    For detached HEAD, returns the commit SHA instead.
+    Returns None for non-git directories.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_path),
+            capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+            if branch == "HEAD":
+                # Detached HEAD — use commit SHA as branch identifier
+                return _get_git_head(repo_path)
+            return branch
+    except Exception:
+        logger.debug("Failed to get git branch for %s", repo_path, exc_info=True)
+    return None
+
+
 @dataclass
 class CodeIndex:
     """Index for a repository's source code."""
@@ -92,6 +117,7 @@ class CodeIndex:
     alias_map: dict[str, list[str]] = field(default_factory=dict)  # tsconfig/jsconfig path aliases; auto-loaded from source_root
     psr4_map: dict[str, str] = field(default_factory=dict)  # PHP PSR-4 namespace map from composer.json; auto-loaded from source_root
     package_names: list[str] = field(default_factory=list)    # Package names published by this repo (from manifest files)
+    branch: str = ""                 # Git branch name at index time (empty = base/default branch or non-git)
 
     def __post_init__(self) -> None:
         if not self.display_name:
@@ -103,6 +129,8 @@ class CodeIndex:
         self._bm25_cache: dict = {}
         # Lazy import-name inverted index — populated on first find_references call
         self._import_name_index: Optional[dict[str, list[tuple[str, dict]]]] = None
+        # Lazy reverse lookup: built on first access via get_callers_by_name()
+        self._callers_by_name: Optional[dict[tuple[str, str], list[str]]] = None
         # Load tsconfig/jsconfig path aliases from source_root if not already provided
         if not self.alias_map and self.source_root:
             try:
@@ -113,11 +141,27 @@ class CodeIndex:
         # Load PSR-4 namespace map from composer.json if PHP files are present
         if not self.psr4_map and self.source_root:
             try:
-                if any(f.endswith(".php") for f in self.source_files):
+                if "php" in self.languages:
                     from ..parser.imports import build_psr4_map
                     self.psr4_map = build_psr4_map(self.source_root)
             except Exception:
                 pass
+
+    def get_callers_by_name(self) -> dict[tuple[str, str], list[str]]:
+        """Lazy reverse lookup: (caller_file, called_name) -> [symbol IDs].
+
+        Built on first call from AST call_references stored per symbol.
+        Keyed by (caller_file, called_name) to avoid bare-name collisions.
+        """
+        if self._callers_by_name is None:
+            idx: dict[tuple[str, str], list[str]] = {}
+            for s in self.symbols:
+                caller_file = s.get("file", "")
+                for ref in s.get("call_references", []):
+                    if caller_file and ref:
+                        idx.setdefault((caller_file, ref), []).append(s["id"])
+            self._callers_by_name = idx
+        return self._callers_by_name
 
     # Keys added by BM25 caching — must not leak into API responses
     _INTERNAL_KEYS = {"_tokens", "_tf", "_dl"}
@@ -268,6 +312,13 @@ class IndexStore:
             return
         for db_file in self.base_path.glob("*.db"):
             self._sqlite.checkpoint_db(db_file)
+
+    def cleanup_orphan_indexes(self) -> int:
+        """Delete indexes whose source_root no longer exists on disk.
+
+        Delegates to SQLiteIndexStore.cleanup_orphan_indexes().
+        """
+        return self._sqlite.cleanup_orphan_indexes()
 
     def _safe_repo_component(self, value: str, field_name: str) -> str:
         """Validate and sanitize owner/name components used in on-disk cache paths.
@@ -517,21 +568,26 @@ class IndexStore:
         """Return True if an index exists (SQLite or JSON)."""
         return self._sqlite.has_index(owner, name) or self._index_path(owner, name).exists()
 
-    def load_index(self, owner: str, name: str) -> Optional[CodeIndex]:
-        """Load index from storage. Prefers SQLite, auto-migrates from JSON."""
+    def load_index(self, owner: str, name: str, branch: str = "") -> Optional[CodeIndex]:
+        """Load index from storage. Prefers SQLite, auto-migrates from JSON.
+
+        When branch is non-empty and a branch delta exists, the base index
+        is composed with the delta to produce a branch-specific view.
+        """
         # Try SQLite first
-        result = self._sqlite.load_index(owner, name)
+        result = self._sqlite.load_index(owner, name, branch=branch)
         if result is not None:
             return result
 
-        # Try auto-migration from JSON
-        index_path = self._index_path(owner, name)
-        if index_path.exists():
-            logger.info("Auto-migrating %s/%s from JSON to SQLite", owner, name)
-            result = self._sqlite.migrate_from_json(index_path, owner, name)
-            if result is not None:
-                _invalidate_index_cache()
-                return result
+        # Try auto-migration from JSON (no branch support for legacy JSON)
+        if not branch:
+            index_path = self._index_path(owner, name)
+            if index_path.exists():
+                logger.info("Auto-migrating %s/%s from JSON to SQLite", owner, name)
+                result = self._sqlite.migrate_from_json(index_path, owner, name)
+                if result is not None:
+                    _invalidate_index_cache()
+                    return result
 
         return None
 
@@ -639,6 +695,18 @@ class IndexStore:
             file_blob_shas=file_blob_shas, file_hashes=file_hashes,
             file_mtimes=file_mtimes,
         )
+
+    def save_branch_delta(self, owner: str, name: str, branch: str, **kwargs) -> None:
+        """Save a branch delta layer. Delegates to SQLite backend."""
+        return self._sqlite.save_branch_delta(owner, name, branch, **kwargs)
+
+    def list_branches(self, owner: str, name: str) -> list[dict]:
+        """List indexed branches for a repo. Delegates to SQLite backend."""
+        return self._sqlite.list_branches(owner, name)
+
+    def delete_branch_delta(self, owner: str, name: str, branch: str) -> bool:
+        """Delete a branch delta. Delegates to SQLite backend."""
+        return self._sqlite.delete_branch_delta(owner, name, branch)
 
     def _languages_from_symbols(self, symbols: list[dict]) -> dict[str, int]:
         """Compute language->file_count from serialized symbols."""
@@ -759,7 +827,7 @@ class IndexStore:
         repos.sort(key=lambda repo: repo["repo"])
         return repos
 
-    def delete_index(self, owner: str, name: str) -> bool:
+    def delete_index(self, owner: str, name: str, force: bool = False) -> bool:
         """Delete an index (SQLite DB + sidecars + content dir).
 
         Legacy .json index files are only deleted when a SQLite .db already
@@ -767,6 +835,13 @@ class IndexStore:
         *only* copy of the data, deleting it would silently discard user data
         with no backup.  In that case we preserve the JSON — it will be
         replaced automatically on the next index_folder / save_index call.
+
+        Args:
+            owner: Repository owner.
+            name: Repository name.
+            force: When True, delete the JSON even if it is the sole copy.
+                Use this from invalidate_cache (explicit user action) to ensure
+                the index is fully cleared including any legacy JSON files.
         """
         db_existed = self._sqlite.has_index(owner, name)
         deleted = self._sqlite.delete_index(owner, name)
@@ -776,8 +851,9 @@ class IndexStore:
         lock_path = self._lock_path(owner, name)
 
         if index_path.exists():
-            if db_existed:
-                # Data was already in SQLite; JSON is a redundant legacy file.
+            if db_existed or force:
+                # Data was already in SQLite (or caller explicitly requests full
+                # wipe); JSON is redundant or force-deleted.
                 index_path.unlink()
                 deleted = True
             else:
@@ -822,6 +898,7 @@ class IndexStore:
             "cyclomatic": getattr(symbol, "cyclomatic", 0) or 0,
             "max_nesting": getattr(symbol, "max_nesting", 0) or 0,
             "param_count": getattr(symbol, "param_count", 0) or 0,
+            "call_references": getattr(symbol, "call_references", []) or [],
         }
 
     def _index_to_dict(self, index: CodeIndex) -> dict:

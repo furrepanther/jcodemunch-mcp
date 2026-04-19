@@ -14,6 +14,8 @@ Quickstart - https://github.com/jgravelle/jcodemunch-mcp/blob/main/QUICKSTART.md
 | [QUICKSTART.md](QUICKSTART.md) | Zero-to-indexed in three steps |
 | [USER_GUIDE.md](USER_GUIDE.md) | Full tool reference, workflows, and best practices |
 | [AGENT_HOOKS.md](AGENT_HOOKS.md) | Agent hooks and prompt policies |
+| [CONFIGURATION.md](CONFIGURATION.md) | JSONC config file reference, migration from env vars |
+| [GROQ.md](GROQ.md) | Groq Remote MCP integration, deployment, gcm CLI |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Internal design, storage model, and extension points |
 | [LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md) | Supported languages and parsing details |
 | [CONTEXT_PROVIDERS.md](CONTEXT_PROVIDERS.md) | dbt, Git, and custom context provider docs |
@@ -42,6 +44,33 @@ In retrieval-heavy workflows, that routinely cuts code-reading token usage by **
 
 Index once. Query cheaply. Keep moving.
 **Precision context beats brute-force context.**
+
+---
+
+## Compact output — the second token axis (MUNCH)
+
+Retrieval decides **what** to send. MUNCH decides **how to pack it**.
+
+Every tool response can be emitted in a purpose-built compact wire format
+instead of verbose JSON. Path prefixes are interned to short handles,
+homogeneous lists of dicts pack into single-character-tagged CSV rows, and
+per-column types are preserved so the decode is lossless.
+
+```python
+# any tool call accepts format=
+find_references(identifier="get_user", format="auto")
+# auto  — emit compact if savings ≥ 15%, otherwise JSON
+# compact — always compact
+# json    — never compact (back-compat passthrough)
+```
+
+Benchmark (v1.56.0): median **45.5%** bytes saved across 6 representative
+tools, peaks at **55.4%** on graph and outline responses. Full spec in
+[SPEC_MUNCH.md](SPEC_MUNCH.md); numbers and harness in
+[TOKEN_SAVINGS.md](TOKEN_SAVINGS.md).
+
+Encoding savings stack on top of retrieval savings — every byte off the wire
+is a byte the agent doesn't pay to read.
 
 ---
 
@@ -105,7 +134,7 @@ That means:
 
 It indexes your codebase once using tree-sitter, stores structured symbol metadata plus byte offsets into the original source, and retrieves exact implementations on demand instead of re-reading entire files over and over.
 
-Recent releases have made that retrieval workflow sharper and more useful in real engineering work, with BM25-based symbol search, fuzzy matching, semantic/hybrid search (opt-in, zero mandatory dependencies), query-driven token-budgeted context assembly (`get_ranked_context`), dead code detection (`find_dead_code`), git-diff-to-symbol mapping (`get_changed_symbols`), architectural centrality ranking (`get_symbol_importance`, PageRank), blast-radius depth scoring, context bundles with token budgets, dependency graphs, class hierarchy traversal, multi-symbol bundles, live watch-based reindexing, automatic Claude Code worktree discovery (`watch-claude`), and trusted-folder access controls.
+Recent releases have made that retrieval workflow sharper and more useful in real engineering work, with BM25-based symbol search, fuzzy matching, semantic/hybrid search (opt-in, zero mandatory dependencies), query-driven token-budgeted context assembly (`get_ranked_context`), dead code detection (`find_dead_code`), untested symbol detection (`get_untested_symbols`), git-diff-to-symbol mapping (`get_changed_symbols`), architectural centrality ranking (`get_symbol_importance`, PageRank), blast-radius depth scoring with source snippets, context bundles with token budgets, AST-derived call graphs and call hierarchy traversal, decorator-aware search and filtering, hotspot detection (complexity x churn), dependency cycles and coupling metrics, session-aware routing (`plan_turn`, turn budgets, negative evidence), agent config auditing, complexity-based model routing (Agent Selector), enforcement hooks (PreToolUse/PostToolUse/PreCompact), dependency graphs, class hierarchy traversal, multi-symbol bundles, live watch-based reindexing, automatic Claude Code worktree discovery (`watch-claude`), auto-watch on demand (when `watch: true` in config, the server automatically indexes and watches any repo a tool is called against — ensuring fresh results from the first call), trusted-folder access controls, edit-ready refactoring plans (`plan_refactoring`) for rename, move, extract, and signature change operations, symbol provenance archaeology (`get_symbol_provenance` — full git lineage, semantic commit classification, evolution narrative), unified PR risk profiling (`get_pr_risk_profile` — composite risk score fusing blast radius, complexity, churn, test gaps, and volume), automatic response secret redaction (AWS/GCP/Azure/JWT/GitHub tokens scrubbed before reaching the LLM context window), and cross-language AST pattern matching (`search_ast` — 10 preset anti-pattern detectors + custom mini-DSL for structural queries like `call:*.unwrap`, `string:/password/i`, `nesting:5+`; works across all 70+ languages with universal node-type mapping).
 
 ---
 
@@ -158,6 +187,8 @@ jCodeMunch fixes that by giving them a structured way to:
 * grab a token-budgeted context bundle or ranked context pack for a task
 * fall back to text search when structure alone is not enough
 * detect dead code, trace impact, rank by centrality, and map git diffs to symbols
+* plan the next turn with `plan_turn` — confidence-guided routing before the first read
+* track session state and avoid re-reading files the agent already explored
 
 Agents do not need bigger and bigger context windows.
 
@@ -181,15 +212,33 @@ Send the model the code it needs, not 1,500 lines of collateral damage.
 
 ### Structural queries native tools can't answer
 
-`find_importers` tells you what imports a file. `get_blast_radius` tells you what breaks if you change a symbol, with depth-weighted risk scores. `get_class_hierarchy` traverses inheritance chains. `find_dead_code` finds symbols and files unreachable from any entry point. `get_changed_symbols` maps a git diff to the exact symbols that were added, modified, or removed. `get_symbol_importance` ranks your codebase by architectural centrality using PageRank on the import graph. These are not "faster grep" — they are questions grep cannot answer at all.
+`find_importers` tells you what imports a file. `get_blast_radius` tells you what breaks if you change a symbol, with depth-weighted risk scores and optional source snippets. `get_class_hierarchy` traverses inheritance chains. `get_call_hierarchy` traces callers and callees N levels deep using AST-derived call graphs, with optional LSP-enriched dispatch resolution for interface/trait method calls. `find_dead_code` finds symbols and files unreachable from any entry point. `get_untested_symbols` finds functions with no evidence of test-file reachability — the intersection of import-graph analysis and test-file detection. `get_changed_symbols` maps a git diff to the exact symbols that were added, modified, or removed. `get_symbol_importance` ranks your codebase by architectural centrality using PageRank on the import graph. `get_hotspots` surfaces the riskiest code by combining complexity with git churn. `get_dependency_cycles` detects circular imports. `get_coupling_metrics` measures module coupling and instability. `get_tectonic_map` discovers the logical module topology by fusing three coupling signals (imports, shared references, git co-churn) — revealing hidden module boundaries, misplaced files, and god-module risk without any configuration. `get_signal_chains` traces how external signals (HTTP requests, CLI commands, scheduled tasks, events) propagate through the codebase via the call graph — discovery mode maps all entry-point-to-leaf pathways and reports orphan symbols, lookup mode tells you which user-facing chains a specific symbol participates in (e.g. "validate_email sits on POST /api/users and cli:import-users"). These are not "faster grep" — they are questions grep cannot answer at all.
 
 ### Agent config hygiene
 
 `audit_agent_config` scans your CLAUDE.md, .cursorrules, copilot-instructions.md, and other agent config files for token waste: per-file token cost, stale symbol references (cross-referenced against the index — catches renamed or deleted functions), dead file paths, redundancy between global and project configs, bloat, and scope leaks. No other tool can tell you "line 15 references a function that was renamed three weeks ago."
 
+### Symbol provenance and PR risk profiling
+
+`get_symbol_provenance` is git archaeology: given a symbol, it traces every commit that touched it, classifies each into semantic categories (creation, bugfix, refactor, feature, perf, rename, revert), extracts commit intent, and generates a human-readable narrative explaining who created it, why, and how it evolved. `get_pr_risk_profile` produces a unified risk assessment for a branch or PR — one call fuses blast radius, complexity, churn, test gaps, and change volume into a composite risk score (0.0–1.0) with actionable recommendations. All responses are automatically scanned for leaked credentials (AWS keys, JWTs, GCP service accounts, etc.) and redacted before reaching the LLM.
+
+### Cross-language AST pattern matching
+
+`search_ast` brings structural code analysis to every language jCodeMunch indexes — write one query, match across all 70+ languages. **Preset anti-patterns** detect common problems without any configuration: `empty_catch` (silently swallowed errors), `bare_except` (catch-all handlers), `deeply_nested` (5+ control-flow levels), `nested_loops` (O(n³)+ performance risk), `god_function` (100+ line functions), `eval_exec` (injection-risk dynamic execution), `hardcoded_secret` (credential patterns in strings), `todo_fixme` (unfinished work markers), `magic_number` (unexplained numeric constants), and `reassigned_param` (overwritten function parameters). Run `category='all'` for a full sweep, or focus on `security`, `error_handling`, `complexity`, `performance`, or `maintenance`. **Custom queries** use a mini-DSL: `call:*.unwrap` (find method calls by glob), `string:/password/i` (regex over string literals), `comment:/TODO/i` (regex in comments), `nesting:5+`, `loops:3+`, `lines:80+` (threshold queries). Every match is attributed to its enclosing indexed symbol with complexity metadata — so you can see not just *where* the problem is, but *how bad* the surrounding function already is.
+
+### Multi-axis constraint queries
+
+`winnow_symbols` composes signals that every other tool exposes separately — kind, complexity, decorator, direct call references, file glob, name regex, git churn, and PageRank importance — into a single AND-intersected query. Agents stop making four or five calls and merging results by hand: "functions that call `db.Exec`, cyclomatic > 10, churned in the last 30 days, ranked by importance" resolves in one round trip. Supported axes expose their own operator set (`eq`, `in`, `matches`, `contains`, numeric comparisons); the window for churn-based filters is per-criterion. Results include per-symbol importance, complexity, and churn scores so the agent can explain *why* each survivor made the cut.
+
 ### Better engineering workflows
 
 Useful for onboarding, debugging, refactoring, impact analysis, and exploring unfamiliar repos without brute-force file reading.
+
+### Refactoring Planner
+
+`plan_refactoring` generates exact edit-ready instructions for rename, move, extract, and
+signature change operations. Returns `{old_text, new_text}` blocks compatible with any editor's
+find-and-replace, plus import rewrites, collision detection, new file generation, and multi-file coordination.
 
 ### Local-first speed
 
@@ -215,6 +264,10 @@ So when the agent wants a symbol, jCodeMunch can fetch the exact source directly
 
 ## Start fast
 
+> **Ubuntu 24.04+ / Debian 12+:** System Python is externally managed (PEP 668).
+> Use `pipx install jcodemunch-mcp` or `uv tool install jcodemunch-mcp` instead
+> of bare `pip install`.
+
 ### Option A: One command (recommended)
 
 ```bash
@@ -222,12 +275,12 @@ pip install jcodemunch-mcp
 jcodemunch-mcp init
 ```
 
-`init` auto-detects your MCP clients (Claude Code, Claude Desktop, Cursor, Windsurf, Continue), writes their config entries, installs the CLAUDE.md prompt policy so your agent actually uses jCodeMunch, optionally indexes your project, and audits your agent config files for token waste. Run `jcodemunch-mcp init --help` for all flags.
+`init` auto-detects your MCP clients (Claude Code, Claude Desktop, Cursor, Windsurf, Continue), writes their config entries, installs the CLAUDE.md prompt policy so your agent actually uses jCodeMunch, optionally installs enforcement hooks (PreToolUse read guard + PostToolUse auto-reindex + PreCompact session snapshot), optionally indexes your project, and audits your agent config files for token waste. Run `jcodemunch-mcp init --help` for all flags.
 
 For non-interactive CI or scripting:
 
 ```bash
-jcodemunch-mcp init --yes --claude-md global --index --audit
+jcodemunch-mcp init --yes --claude-md global --hooks --index --audit
 ```
 
 ### Option B: Manual setup
@@ -237,6 +290,27 @@ jcodemunch-mcp init --yes --claude-md global --index --audit
 ```bash
 pip install jcodemunch-mcp
 ```
+
+> **Want semantic search?** Install the local embedding extra for zero-config
+> semantic search — no API keys, no internet after first download:
+>
+> ```bash
+> pip install "jcodemunch-mcp[local-embed]"  # bundled ONNX encoder (recommended)
+> jcodemunch-mcp download-model              # fetch model (~23 MB, one-time)
+> ```
+>
+> **Want AI-generated summaries?** Install the extra for your provider:
+>
+> ```bash
+> pip install "jcodemunch-mcp[anthropic]"   # Claude
+> pip install "jcodemunch-mcp[gemini]"      # Gemini
+> pip install "jcodemunch-mcp[openai]"      # OpenAI-compatible
+> pip install "jcodemunch-mcp[all]"         # all providers + local embeddings
+> ```
+>
+> Without an extra, summaries fall back to signatures (which still works — you
+> just get shorter descriptions). Run `jcodemunch-mcp config --check` to verify
+> your provider is installed and working.
 
 #### 2. Add it to your MCP client
 
@@ -283,6 +357,128 @@ Use jcodemunch-mcp for code lookup whenever available. Prefer symbol search, out
 
 ---
 
+## Starter Packs
+
+Pre-built indexes for popular frameworks and libraries. Skip the initial indexing step — install a pack and start querying immediately.
+
+```bash
+# List available packs
+jcodemunch-mcp install-pack --list
+
+# Install a free pack
+jcodemunch-mcp install-pack fastapi
+
+# Install a licensed pack
+jcodemunch-mcp install-pack express --license YOUR-KEY
+```
+
+Free packs require no license. Licensed packs require a [jCodeMunch license](https://j.gravelle.us/jCodeMunch/#pricing). Use `--force` to re-download an already-installed pack.
+
+---
+
+## Groq Integration
+
+Use jCodeMunch as a remote MCP tool with [Groq's](https://groq.com) ultra-fast inference — answer codebase questions in seconds with zero local setup.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="YOUR_GROQ_KEY", base_url="https://api.groq.com/openai/v1")
+
+response = client.responses.create(
+    model="llama-3.3-70b-versatile",
+    input="What does parse_file do in jgravelle/jcodemunch-mcp?",
+    tools=[{
+        "type": "mcp",
+        "server_label": "jcodemunch",
+        "server_url": "https://YOUR_JCODEMUNCH_URL",
+        "headers": {"Authorization": "Bearer YOUR_TOKEN"},
+        "server_description": "Code intelligence via tree-sitter AST parsing.",
+        "require_approval": "never",
+    }],
+)
+```
+
+Groq handles MCP tool discovery and execution server-side — one API call, no orchestration needed.
+
+Self-host with Docker + Caddy for auto-TLS:
+
+```bash
+DOMAIN=mcp.example.com JCODEMUNCH_HTTP_TOKEN=secret docker compose up -d
+```
+
+See **[GROQ.md](GROQ.md)** for the full tutorial: allowed-tools presets, model recommendations, deployment options, and validation scripts.
+
+### speedreview — AI Code Review GitHub Action
+
+Get a structured PR review in under 5 seconds:
+
+```yaml
+# .github/workflows/speedreview.yml
+- uses: jgravelle/jcodemunch-mcp/speedreview@main
+  with:
+    groq_api_key: ${{ secrets.GROQ_API_KEY }}
+```
+
+See **[speedreview/README.md](speedreview/README.md)** for full setup and configuration.
+
+### gcm — Codebase Q&A CLI
+
+Ask any question about any codebase. Get an answer in under 3 seconds.
+
+```bash
+pip install jcodemunch-mcp[groq]
+export GROQ_API_KEY=gsk_...
+
+# Ask about a GitHub repo (auto-indexes on first use)
+gcm "how does authentication work?" --repo pallets/flask
+
+# Ask about the current directory
+gcm "where are the API routes defined?"
+
+# Interactive chat mode
+gcm --chat --repo facebook/react
+
+# Use the fast 8B model
+gcm "what does parse_file do?" --fast
+```
+
+Combines jCodeMunch's token-efficient retrieval (BM25 + PageRank) with Groq's 280+ tok/s inference for near-instant answers. See `gcm --help` for all options.
+
+### gcm --voice — Voice-to-Codebase
+
+Speak a question, hear the answer. Full audio loop: Whisper STT → retrieval → LLM → Orpheus TTS.
+
+```bash
+pip install jcodemunch-mcp[groq-voice]
+
+# Voice conversation with a codebase
+gcm --voice --repo pallets/flask
+
+# Press Enter to start recording, Enter again to stop
+# Or type a question directly as text fallback
+```
+
+Push-to-talk via Enter key. Caps answers to ~100 words for natural spoken delivery. Requires a microphone.
+
+### gcm explain — Auto Repo Explainer
+
+Generate a narrated explainer video for any codebase in a single command.
+
+```bash
+pip install jcodemunch-mcp[groq-explain]
+
+# Generate a 60-second narrated explainer
+gcm explain --repo pallets/flask -o flask-explainer.mp4
+
+# With verbose timing
+gcm explain --repo facebook/react -v
+```
+
+Pipeline: repo structure → LLM narration script → Orpheus TTS → Pillow slides → FFmpeg MP4. Requires FFmpeg on PATH.
+
+---
+
 ## Configuration
 
 Settings are controlled by a JSONC config file (`config.jsonc`) with env var fallbacks for backward compatibility. Defaults are chosen so that a fresh install works without any configuration.
@@ -310,12 +506,52 @@ Project config merges over global config — closest to the work wins.
 
 | Config key | What it controls | Typical savings |
 |-----------|-----------------|----------------|
-| `disabled_tools` | Remove tools from schema entirely | ~100–400 tokens/tool |
+| `tool_profile` | `"core"` (16 tools), `"standard"` (51), `"full"` (62, default) | ~5-6k tokens (core) |
+| `compact_schemas` | Strip rarely-used advanced params from schemas | ~1-2k tokens |
+| `disabled_tools` | Remove individual tools from schema entirely | ~100–400 tokens/tool |
 | `languages` | Shrink language enum + gate features | ~2–86 tokens/turn |
 | `meta_fields` | Filter `_meta` response fields | ~50–150 tokens/call |
 | `descriptions` | Control description verbosity | ~0–600 tokens/turn |
 
+**Recommended for context-conscious setups:** `"tool_profile": "core", "compact_schemas": true` reduces the schema footprint from ~11.5k tokens to ~4k tokens.
+
 See the full template for all available keys. Run `jcodemunch-mcp config --init` to generate one.
+
+### Tool Tiering
+
+jcodemunch-mcp exposes 60+ tools. On request-capped plans, having all of them visible to small models causes primitive-preference bias (many `search → read → search → read` cycles instead of one `get_context_bundle`). The server mitigates this by narrowing the exposed tool list per the running model.
+
+#### Tiers (configurable)
+
+Three tiers ship with sensible defaults, fully editable in `config.jsonc`:
+
+- `core` (16 tools): indexing, search, retrieval. Recommended for Haiku / small local models.
+- `standard` (51 tools): core + analytics / architecture / quality. Recommended for Sonnet / GPT-4o class.
+- `full` (all 62 tools): no filter. Recommended for Opus / o1 / frontier models.
+
+Edit `tool_tier_bundles.core` / `tool_tier_bundles.standard` in your `config.jsonc` to add or remove tools from each tier.
+
+#### Runtime switching (opt-in, zero extra requests)
+
+Runtime tier switching is **off by default**. To enable it, set in `config.jsonc`:
+
+```jsonc
+"adaptive_tiering": true
+```
+
+When on, `plan_turn` — already the opening-move tool — accepts an optional `model` parameter that switches the session tier as a side effect, with **no extra MCP request**:
+
+```
+plan_turn(repo="...", query="...", model="claude-haiku-4-5")
+```
+
+The server resolves the model to a tier via `model_tier_map` in config (fuzzy matching: normalizes the id, then exact → glob → substring → `*` → `full` fallback). Subsequent `tools/list` calls return only the narrowed set.
+
+When `adaptive_tiering` is false, `plan_turn(model=...)` and `announce_model(...)` accept their arguments but do not switch the tier — the static `tool_profile` continues to drive the exposed tools. `set_tool_tier(tier=...)` remains honored either way because it's an explicit user call, not automatic behavior.
+
+#### `disabled_tools` precedence
+
+`disabled_tools` applies **after** tier filtering. A tool listed in both a tier bundle and `disabled_tools` will not be exposed. The server logs a `WARNING` on startup and `jcodemunch-mcp config --check` prints a `WARN:` row if this happens.
 
 ### Architecture layer enforcement (`architecture.layers`)
 
@@ -409,6 +645,29 @@ The cases where it doesn't help: edits that genuinely require understanding the 
 Start with **[QUICKSTART.md](QUICKSTART.md)** for the fastest setup path.
 
 Then index a repo, ask your agent what it has indexed, and have it retrieve code by symbol instead of reading entire files. That is where the savings start.
+
+## Works with
+
+jCodeMunch plugs into any MCP-compatible agent or IDE. Tested configurations:
+
+| Platform | Config |
+|----------|--------|
+| **Claude Code / Claude Desktop** | `jcodemunch-mcp init` (auto-detects and patches config) |
+| **Cursor / Windsurf** | `jcodemunch-mcp init` or manual `mcp.json` |
+| **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** | Add to `~/.hermes/config.yaml` — see [skill](https://github.com/NousResearch/hermes-agent/pull/10413) |
+| **Any MCP client** | stdio: `jcodemunch-mcp`, HTTP: `jcodemunch-mcp serve --transport sse` |
+
+<details>
+<summary>Hermes Agent config</summary>
+
+```yaml
+# ~/.hermes/config.yaml
+mcp_servers:
+  jcodemunch:
+    command: "uvx"
+    args: ["jcodemunch-mcp"]
+```
+</details>
 
 ## Star History
 

@@ -262,11 +262,60 @@ DEFAULTS = {
     "gitignore_warn_threshold": 500,
     "extra_ignore_patterns": [],
     "exclude_secret_patterns": [],
+    "exclude_skip_directories": [],
     "extra_extensions": {},
     "context_providers": True,
     "meta_fields": [],  # [] = no _meta (token-efficient; set null in config for all fields)
     "languages": None,  # None = all languages
     "languages_adaptive": False,
+    "tool_profile": "full",  # "core", "standard", or "full"
+    "tool_tier_bundles": {
+        "core": [
+            "index_repo", "index_folder", "index_file",
+            "list_repos", "resolve_repo",
+            "get_repo_outline", "get_file_tree", "get_file_outline",
+            "search_symbols", "get_symbol_source", "get_file_content",
+            "search_text", "get_context_bundle", "get_ranked_context",
+            "find_importers", "find_references",
+        ],
+        "standard": [
+            # core ∪ these additional tools
+            "index_repo", "index_folder", "index_file",
+            "list_repos", "resolve_repo",
+            "get_repo_outline", "get_file_tree", "get_file_outline",
+            "search_symbols", "get_symbol_source", "get_file_content",
+            "search_text", "get_context_bundle", "get_ranked_context",
+            "find_importers", "find_references",
+            "summarize_repo", "embed_repo", "suggest_queries",
+            "search_columns", "check_references",
+            "get_dependency_graph", "get_class_hierarchy",
+            "get_related_symbols", "get_call_hierarchy",
+            "get_blast_radius", "check_rename_safe",
+            "get_impact_preview", "get_changed_symbols",
+            "get_symbol_diff", "get_symbol_provenance",
+            "get_pr_risk_profile", "get_symbol_complexity",
+            "get_churn_rate", "get_hotspots",
+            "get_symbol_importance", "find_dead_code",
+            "get_dead_code_v2", "get_untested_symbols",
+            "get_repo_health", "search_ast", "winnow_symbols",
+            "get_dependency_cycles", "get_coupling_metrics",
+            "get_layer_violations", "get_cross_repo_map",
+            "get_tectonic_map", "get_signal_chains", "render_diagram",
+            "get_project_intel", "invalidate_cache",
+        ],
+    },
+    "model_tier_map": {
+        "claude-opus": "full",
+        "claude-sonnet": "standard",
+        "claude-haiku": "core",
+        "gpt-4o": "standard",
+        "gpt-5": "full",
+        "o1": "full",
+        "llama": "core",
+        "*": "full",
+    },
+    "adaptive_tiering": False,
+    "compact_schemas": False,
     "disabled_tools": ["test_summarizer"],
     "descriptions": {},
     "transport": "stdio",
@@ -286,6 +335,7 @@ DEFAULTS = {
     "summarizer_model": "",
     "embed_model": "",
     "claude_poll_interval": 5.0,
+    "worktree_base_path": "",
     "log_level": "WARNING",
     "log_file": None,
     "redact_source_root": False,
@@ -297,6 +347,24 @@ DEFAULTS = {
     "path_map": "",
     "cross_repo_default": False,
     "discovery_hint": True,
+    # Session-aware routing (Feature 6)
+    "negative_evidence_threshold": 0.5,
+    "search_result_cache_max": 128,
+    "session_journal": True,
+    "plan_turn_high_threshold": 2.0,
+    "plan_turn_medium_threshold": 0.5,
+    "turn_budget_tokens": 20000,
+    "turn_gap_seconds": 30.0,
+    "session_resume": False,
+    "session_max_age_minutes": 30,
+    "session_max_queries": 50,
+    # Agent Selector
+    "agent_selector": {},
+    # LSP enrichment
+    "enrichment": {},
+    # Mermaid Viewer
+    "render_diagram_viewer_enabled": False,
+    "mermaid_viewer_path": "",
 }
 
 CONFIG_TYPES = {
@@ -311,11 +379,17 @@ CONFIG_TYPES = {
     "gitignore_warn_threshold": int,
     "extra_ignore_patterns": list,
     "exclude_secret_patterns": list,
+    "exclude_skip_directories": list,
     "extra_extensions": dict,
     "context_providers": bool,
     "meta_fields": (list, type(None)),
     "languages": (list, type(None)),
     "languages_adaptive": bool,
+    "tool_profile": str,
+    "tool_tier_bundles": dict,
+    "model_tier_map": dict,
+    "adaptive_tiering": bool,
+    "compact_schemas": bool,
     "disabled_tools": list,
     "descriptions": dict,
     "transport": str,
@@ -335,6 +409,7 @@ CONFIG_TYPES = {
     "summarizer_model": str,
     "embed_model": str,
     "claude_poll_interval": float,
+    "worktree_base_path": str,
     "log_level": str,
     "log_file": (str, type(None)),
     "redact_source_root": bool,
@@ -348,6 +423,21 @@ CONFIG_TYPES = {
     "discovery_hint": bool,
     "version": str,
     "architecture": dict,
+    # Session-aware routing
+    "negative_evidence_threshold": float,
+    "search_result_cache_max": int,
+    "session_journal": bool,
+    "plan_turn_high_threshold": float,
+    "plan_turn_medium_threshold": float,
+    "turn_budget_tokens": int,
+    "turn_gap_seconds": float,
+    "session_resume": bool,
+    "session_max_age_minutes": int,
+    "session_max_queries": int,
+    "agent_selector": dict,
+    "enrichment": dict,
+    "render_diagram_viewer_enabled": bool,
+    "mermaid_viewer_path": str,
 }
 
 
@@ -1085,37 +1175,68 @@ def generate_template() -> str:
     # All available tools (for disabled_tools reference) - sorted alphabetically
     # Removed: wait_for_fresh (v1.12.0 - check_freshness and wait_for_fresh tools removed)
     all_tools = sorted([
+        "announce_model",
+        "audit_agent_config",
         "check_references",
+        "check_rename_safe",
         "embed_repo",
         "find_dead_code",
         "find_importers",
         "find_references",
         "get_blast_radius",
+        "get_call_hierarchy",
         "get_changed_symbols",
+        "get_churn_rate",
         "get_class_hierarchy",
         "get_context_bundle",
+        "get_coupling_metrics",
+        "get_cross_repo_map",
+        "get_dead_code_v2",
+        "get_dependency_cycles",
         "get_dependency_graph",
+        "get_extraction_candidates",
         "get_file_content",
         "get_file_outline",
         "get_file_tree",
+        "get_hotspots",
+        "get_impact_preview",
+        "get_layer_violations",
+        "get_pr_risk_profile",
+        "get_project_intel",
         "get_ranked_context",
         "get_related_symbols",
+        "get_repo_health",
         "get_repo_outline",
+        "get_session_context",
+        "get_session_snapshot",
         "get_session_stats",
+        "get_signal_chains",
+        "get_symbol_complexity",
         "get_symbol_diff",
         "get_symbol_importance",
+        "get_symbol_provenance",
         "get_symbol_source",
+        "get_tectonic_map",
+        "get_untested_symbols",
         "index_file",
         "index_folder",
         "index_repo",
         "invalidate_cache",
         "list_repos",
+        "plan_refactoring",
+        "plan_turn",
+        "register_edit",
+        "render_diagram",
         "resolve_repo",
+        "search_ast",
         "search_columns",
         "search_symbols",
         "search_text",
+        "set_tool_tier",
         "suggest_queries",
+        "summarize_repo",
         "test_summarizer",
+        "winnow_symbols",
     ])
     tools_str = "\n  // ".join(f'"{t}",' for t in all_tools)
 
@@ -1187,6 +1308,10 @@ def generate_template() -> str:
   //   Glob patterns to exclude from *secret* detection.
   //   Use when *secret* has false positives on specific paths.
 
+  // "exclude_skip_directories": [],
+  //   Directory names to remove from the built-in skip list.
+  //   Example: ["proto"] to index protobuf directories.
+
   // "extra_extensions": {{}},
   //   Map additional file extensions to languages.
   //   Example: {{".mpl": "cpp"}} to parse .mpl files as C++.
@@ -1222,6 +1347,20 @@ def generate_template() -> str:
   //   Set in global config to auto-create project configs on first index.
   //   Set in project config to enable ongoing adaptation.
 
+  // === Tool Profile ===
+  // Controls how many tools are loaded into the LLM context.
+  //   "core"     — ~16 essential tools (indexing, search, retrieval). Lowest token cost.
+  //   "standard" — core + analytics, architecture, quality tools (~40 tools).
+  //   "full"     — all tools including refactoring, session, and diagnostics (default).
+  // Tip: "core" saves ~5-6k schema tokens per session.
+  // "tool_profile": "full",
+
+  // === Compact Schemas ===
+  // When true, strips rarely-used advanced parameters (debug, fusion, semantic_*,
+  // fuzzy_*, etc.) from tool schemas. The server still accepts them — they're just
+  // hidden from the LLM to save tokens. Saves ~1-2k tokens on top of any profile.
+  // "compact_schemas": false,
+
   // === Disabled Tools ===
   // Global: tools listed here are removed from the schema entirely.
   // Project: tools listed here are rejected at call_tool() with an
@@ -1234,6 +1373,74 @@ def generate_template() -> str:
     "test_summarizer",
   // {tools_str}
   ],
+
+  // === Tool Tier Bundles ===
+  // Which tools belong to each tier. Edit freely. Both tool_profile (below)
+  // and the runtime set_tool_tier / announce_model tools read from here.
+  // NOTE: disabled_tools applies AFTER tier filtering — a tool listed both
+  // in a bundle and in disabled_tools will not be exposed regardless of tier.
+  "tool_tier_bundles": {{
+    "core": [
+      "index_repo", "index_folder", "index_file",
+      "list_repos", "resolve_repo",
+      "get_repo_outline", "get_file_tree", "get_file_outline",
+      "search_symbols", "get_symbol_source", "get_file_content",
+      "search_text", "get_context_bundle", "get_ranked_context",
+      "find_importers", "find_references"
+    ],
+    "standard": [
+      "index_repo", "index_folder", "index_file",
+      "list_repos", "resolve_repo",
+      "get_repo_outline", "get_file_tree", "get_file_outline",
+      "search_symbols", "get_symbol_source", "get_file_content",
+      "search_text", "get_context_bundle", "get_ranked_context",
+      "find_importers", "find_references",
+      "summarize_repo", "embed_repo", "suggest_queries",
+      "search_columns", "check_references",
+      "get_dependency_graph", "get_class_hierarchy",
+      "get_related_symbols", "get_call_hierarchy",
+      "get_blast_radius", "check_rename_safe",
+      "get_impact_preview", "get_changed_symbols",
+      "get_symbol_diff", "get_symbol_provenance",
+      "get_pr_risk_profile", "get_symbol_complexity",
+      "get_churn_rate", "get_hotspots",
+      "get_symbol_importance", "find_dead_code",
+      "get_dead_code_v2", "get_untested_symbols",
+      "get_repo_health", "search_ast", "winnow_symbols",
+      "get_dependency_cycles", "get_coupling_metrics",
+      "get_layer_violations", "get_cross_repo_map",
+      "get_tectonic_map", "get_signal_chains", "render_diagram",
+      "get_project_intel", "invalidate_cache"
+    ]
+  }},
+
+  // === Model → Tier Map ===
+  // Maps model identifiers (self-reported by the agent via plan_turn(model=...)
+  // or announce_model) to a tier. Matching is fuzzy: normalize (lowercase,
+  // strip provider prefix / date suffix / bracket suffix), then try exact,
+  // glob, substring, "*", hardcoded "full" fallback in that order.
+  // Keep keys specific where possible: very short substrings (e.g. "o1") can
+  // over-match model ids that merely contain that token.
+  "model_tier_map": {{
+    "claude-opus": "full",
+    "claude-sonnet": "standard",
+    "claude-haiku": "core",
+    "gpt-4o": "standard",
+    "gpt-5": "full",
+    "o1": "full",
+    "llama": "core",
+    "*": "full"
+  }},
+
+  // === Adaptive Tiering (opt-in) ===
+  // When true, the exposed tool list narrows at runtime based on the model
+  // identifier self-reported by the agent via plan_turn(model=...) or
+  // announce_model(). When false (default), the static tool_profile above
+  // controls the exposed tools for the whole session — the runtime tools
+  // accept their arguments but do not switch tiers. set_tool_tier is always
+  // honored regardless of this flag (explicit user override, not automatic
+  // behavior).
+  // "adaptive_tiering": false,
 
   // === Descriptions ===
   // Append text to shortened tool/param descriptions.
@@ -1289,6 +1496,10 @@ def generate_template() -> str:
   //   Only applies when freshness_mode is "strict". Default: 500.
   // "claude_poll_interval": 5.0,
   //   Seconds between polling Claude Code worktrees for changes.
+  // "worktree_base_path": "",
+  //   Absolute path for git worktrees created by hook-event.
+  //   Default: <cwd>/.claude/worktrees/<name> (Claude Code convention).
+  //   Set to e.g. "~/.claude-worktrees" to store all worktrees centrally.
 
   // === Logging ===
   // "log_level": "WARNING",
@@ -1313,6 +1524,33 @@ def generate_template() -> str:
   //   Consecutive batch failures before the AI summarizer gives up and
   //   falls back to signature summaries for remaining symbols.
   //   Set 0 to disable the circuit breaker (never stop retrying).
+
+  // === Session-Aware Routing ===
+  // "negative_evidence_threshold": 0.5,
+  //   BM25 score threshold for negative evidence in search_symbols.
+  //   When the best match score is below this, the response includes
+  //   structured negative_evidence to prevent AI hallucination.
+  // "search_result_cache_max": 128,
+  //   Maximum entries in the search_symbols result cache. 0 = disable cache.
+  // "session_journal": true,
+  //   Track file reads, searches, and edits during the MCP session.
+  //   Disable to reduce memory usage in long-running sessions.
+  // "plan_turn_high_threshold": 2.0,
+  //   Minimum BM25 score for plan_turn to report "high" confidence.
+  // "plan_turn_medium_threshold": 0.5,
+  //   Minimum BM25 score for plan_turn to report "medium" confidence.
+  // "turn_budget_tokens": 20000,
+  //   Max tokens returned across all tool calls in a turn. 0 = disabled.
+  // "turn_gap_seconds": 30.0,
+  //   Seconds of silence before a new "turn" begins (heuristic).
+  // "session_resume": false,
+  //   Persist and restore session state (journal, cache) across restarts.
+  //   Writes only on clean shutdown (NVME-friendly). State validated
+  //   against git HEAD (or indexed_at for non-Git projects) on restore.
+  // "session_max_age_minutes": 30,
+  //   Discard saved session state older than this.
+  // "session_max_queries": 50,
+  //   Cap on persisted search cache entries.
 
   // === AI Summarizer ===
   // Controls whether AI is used to generate symbol summaries during indexing.
@@ -1342,5 +1580,24 @@ def generate_template() -> str:
   // "path_map": "",
   //   Cross-platform path remapping. Format: "orig1=new1,orig2=new2".
   //   Allows indexes built on Linux to work on Windows and vice versa.
+
+  // === Mermaid Viewer Integration ===
+  // "render_diagram_viewer_enabled": false,
+  //   When true, render_diagram exposes an extra boolean parameter
+  //   `open_in_viewer` in its tool schema. When the caller sets
+  //   open_in_viewer=true, the produced mermaid is written as a
+  //   self-contained HTML file under <index_path>/temp/mermaid/ and
+  //   opened with the viewer resolved via `mermaid_viewer_path`.
+  //   When false (default), the parameter is hidden from the schema.
+  //   The temp folder is cleaned on server startup and shutdown.
+
+  // "mermaid_viewer_path": "",
+  //   Absolute path to the mmd-viewer executable. Used only when
+  //   render_diagram_viewer_enabled is true and the caller requests
+  //   open_in_viewer=true.
+  //   - Explicit path: used as-is (e.g. "C:/tools/mmd-viewer.exe").
+  //   - Empty string: falls back to "mmd-viewer" on $PATH.
+  //   If neither resolves, render_diagram still returns the mermaid
+  //   markup and adds a non-fatal `viewer_error` field to the result.
 }}
 '''

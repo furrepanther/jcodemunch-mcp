@@ -560,7 +560,7 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `search_symbols` | Search symbol index by name, signature, summary, or docstring; supports kind/language/file_pattern filters, fuzzy matching (`fuzzy`, `fuzzy_threshold`, `max_edit_distance`), centrality-aware ranking (`sort_by`: `relevance`/`centrality`/`combined`), and optional semantic/hybrid search (`semantic`, `semantic_weight`, `semantic_only`) | `repo`, `query`, `kind`, `language`, `file_pattern`, `max_results`, `token_budget`, `detail_level`, `fuzzy`, `sort_by`, `semantic` |
+| `search_symbols` | Search symbol index by name, signature, summary, or docstring; supports kind/language/file_pattern/decorator filters, fuzzy matching (`fuzzy`, `fuzzy_threshold`, `max_edit_distance`), centrality-aware ranking (`sort_by`: `relevance`/`centrality`/`combined`), and optional semantic/hybrid search (`semantic`, `semantic_weight`, `semantic_only`). Returns `negative_evidence` when results are empty or low-confidence | `repo`, `query`, `kind`, `language`, `file_pattern`, `decorator`, `max_results`, `token_budget`, `detail_level`, `fuzzy`, `sort_by`, `semantic` |
 | `search_text` | Full-text search across indexed file contents; supports regex, context lines, and optional semantic search | `repo`, `query`, `is_regex`, `file_pattern`, `max_results`, `context_lines`, `semantic` |
 | `search_columns` | Search column metadata across dbt / SQLMesh / database catalog models | `repo`, `query`, `model_pattern`, `max_results` |
 
@@ -572,13 +572,29 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 | `find_references` | Find all files that import or reference a given identifier; supports batch via `identifiers` | `repo`, `identifier`, `identifiers`, `max_results` |
 | `check_references` | Quick dead-code check: is an identifier referenced anywhere? Combines import + content search | `repo`, `identifier`, `identifiers`, `search_content`, `max_content_results` |
 | `get_dependency_graph` | File-level dependency graph up to 3 hops; direction = imports, importers, or both | `repo`, `file`, `direction`, `depth` |
-| `get_blast_radius` | Which files break if this symbol changes? Returns confirmed/potential impacted files, `overall_risk_score`, `direct_dependents_count`; set `include_depth_scores=true` for `impact_by_depth` grouped by BFS layer | `repo`, `symbol`, `depth`, `include_depth_scores` |
+| `get_blast_radius` | Which files break if this symbol changes? Returns confirmed/potential impacted files, `overall_risk_score`, `direct_dependents_count`; set `include_depth_scores=true` for `impact_by_depth` grouped by BFS layer; `include_source=true` returns source snippets and nearby symbols per entry (capped by `source_budget`); `decorator_filter` restricts to symbols with a given decorator | `repo`, `symbol`, `depth`, `include_depth_scores`, `include_source`, `source_budget`, `decorator_filter` |
+| `get_call_hierarchy` | Callers and callees of a symbol, N levels deep (AST-derived on v8+ indexes, text heuristic fallback) | `repo`, `symbol_id`, `direction`, `depth` |
+| `get_impact_preview` | Transitive "what breaks?" analysis — follows call chains to show downstream impact | `repo`, `symbol_id` |
+| `get_hotspots` | Top-N high-risk symbols ranked by complexity x churn (git commit frequency) | `repo`, `top_n`, `days` |
+| `get_coupling_metrics` | Afferent/efferent coupling and instability for a module path | `repo`, `module_path` |
+| `get_dependency_cycles` | Detect circular dependencies in the import graph | `repo` |
+| `get_extraction_candidates` | Suggest functions that could be extracted from a file based on complexity and caller count | `repo`, `file_path`, `min_complexity`, `min_callers` |
 | `get_symbol_importance` | Rank symbols by architectural centrality using PageRank or in-degree on the import graph; surfaces the most load-bearing symbols in a repo | `repo`, `top_n`, `algorithm`, `scope` |
 | `find_dead_code` | Find symbols and files unreachable from any entry point via the import graph; entry points auto-detected (main, __init__, CLI decorators, etc.) | `repo`, `granularity`, `min_confidence`, `include_tests`, `entry_point_patterns` |
 | `get_changed_symbols` | Map a git diff to affected symbols; detects added/modified/removed/renamed symbols between two commits; optionally includes blast radius per changed symbol | `repo`, `since_sha`, `until_sha`, `include_blast_radius`, `max_blast_depth` |
 | `get_class_hierarchy` | Full inheritance chain (ancestors + descendants) across Python, TS, Java, C#, and more | `repo`, `class_name` |
 | `get_related_symbols` | Symbols related to a given symbol via co-location, shared importers, and name-token overlap | `repo`, `symbol_id`, `max_results` |
 | `get_symbol_diff` | Diff symbol sets of two indexed repo snapshots; detects added, removed, and changed symbols | `repo_a`, `repo_b` |
+
+### Session & Routing
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `plan_turn` | Opening-move router: runs BM25 + PageRank against a query, returns confidence level, recommended symbols/files, insertion point suggestions, and budget advisor | `repo`, `query`, `max_recommended` |
+| `get_session_context` | Returns session history: files read, searches run, edits made, tool call counts — use to avoid re-reading the same files | — |
+| `get_session_snapshot` | Compact ~200-token markdown summary of session state (focus files, edits, searches, negative evidence) — designed for context injection after compaction | — |
+| `register_edit` | Post-edit cache invalidation: clears BM25 and search caches for edited files, optionally reindexes | `file_path`, `reindex` |
+| `get_dead_code_v2` | Multi-signal dead code detection: entry-point reachability, call graph, reference search, framework awareness | `repo`, `min_confidence`, `include_tests` |
 
 ### Utilities
 
@@ -644,6 +660,30 @@ What changed between two repo snapshots?
 
 Database column search (dbt / SQLMesh)?
   → search_columns
+
+Starting a new task — what to look at first?
+  → plan_turn(query="...") — confidence + recommended symbols/files
+
+What files have I already read/edited this session?
+  → get_session_context
+
+Which symbols have a specific decorator (e.g. @app.route, @login_required)?
+  → search_symbols(decorator="route")  or  get_blast_radius(decorator_filter="login_required")
+
+Who calls this function? What does it call?
+  → get_call_hierarchy(symbol_id="...", direction="callers")
+
+Where are the riskiest parts of the codebase?
+  → get_hotspots  (complexity × churn)
+
+Are there circular dependencies?
+  → get_dependency_cycles
+
+Which functions should be extracted/refactored?
+  → get_extraction_candidates(file_path="...")
+
+How tightly coupled is this module?
+  → get_coupling_metrics(module_path="src/core")
 ```
 
 ---
