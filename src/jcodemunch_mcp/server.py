@@ -28,6 +28,7 @@ from .reindex_state import await_freshness_if_strict
 from .path_map import ENV_VAR as _PATH_MAP_ENV_VAR
 from .storage import result_cache_invalidate as _result_cache_invalidate
 from .storage import write_pulse as _write_pulse
+from .startup_state import write_startup_state as _write_startup_state
 
 try:
     from .watcher import watch_folders, WatcherError, WatcherManager
@@ -231,6 +232,81 @@ def _warn_if_http_adaptive_tiering(transport: str) -> None:
     )
     logger.error(message)
     raise HttpAdaptiveTieringError(f"refusing to start: {message}")
+
+
+def _background_startup_detail(phase: str, detail: str, *, storage_path: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+    """Persist the current startup phase for the status board."""
+    payload_metadata = dict(metadata or {})
+    if storage_path:
+        payload_metadata.setdefault("storage_path", storage_path)
+    try:
+        _write_startup_state("initializing", phase=phase, detail=detail, metadata=payload_metadata)
+    except Exception:
+        logger.debug("startup state write failed for phase=%s", phase, exc_info=True)
+
+
+def _run_startup_maintenance_sync(storage_path: str | None) -> None:
+    """Run slow startup maintenance in the background after the server is listening."""
+    cleanup_count = 0
+    cleanup_error = ""
+    _background_startup_detail(
+        "cleanup_orphan_indexes",
+        "Cleaning orphan indexes before background warmup.",
+        storage_path=storage_path,
+    )
+    try:
+        from .storage import IndexStore
+
+        store = IndexStore(base_path=storage_path)
+        try:
+            cleanup_count = store.cleanup_orphan_indexes()
+            if cleanup_count:
+                logger.info("Cleaned up %d orphan index(es)", cleanup_count)
+        finally:
+            store.close()
+    except Exception as exc:
+        cleanup_error = f"{type(exc).__name__}: {exc}"
+        logger.debug("Orphan index cleanup failed during background warmup", exc_info=True)
+
+    _background_startup_detail(
+        "load_all_project_configs",
+        "Loading project configs in the background.",
+        storage_path=storage_path,
+        metadata={
+            "cleanup_count": cleanup_count,
+            "cleanup_error": cleanup_error,
+        },
+    )
+    try:
+        config_module.load_all_project_configs()
+    except Exception as exc:
+        _write_startup_state(
+            "failed",
+            phase="load_all_project_configs",
+            detail=f"{type(exc).__name__}: {exc}",
+            metadata={
+                "cleanup_count": cleanup_count,
+                "cleanup_error": cleanup_error,
+                "storage_path": storage_path or "",
+            },
+        )
+        logger.debug("Project config warmup failed", exc_info=True)
+        return
+
+    _write_startup_state(
+        "ready",
+        phase="startup_warmup_complete",
+        detail="Background warmup complete.",
+        metadata={
+            "cleanup_count": cleanup_count,
+            "cleanup_error": cleanup_error,
+            "storage_path": storage_path or "",
+        },
+    )
+
+
+async def _run_startup_maintenance(storage_path: str | None) -> None:
+    await asyncio.to_thread(_run_startup_maintenance_sync, storage_path)
 
 
 def _log_startup_validation_warnings() -> None:
@@ -3872,6 +3948,7 @@ async def run_stdio_server():
     """Run the MCP server over stdio (default)."""
     import sys
     from mcp.server.stdio import stdio_server
+    storage_path = os.environ.get("CODE_INDEX_PATH")
     print(f"jcodemunch-mcp {__version__} by jgravelle · https://github.com/jgravelle/jcodemunch-mcp", file=sys.stderr)
     logger.info(
         "startup version=%s transport=stdio storage=%s ai_summaries=%s",
@@ -3883,14 +3960,34 @@ async def run_stdio_server():
     _restore_session_state()
     # Log tier bundle / disabled_tools overlap warnings
     _log_startup_validation_warnings()
+    startup_task: asyncio.Task | None = None
     try:
+        _background_startup_detail(
+            "server_boot",
+            "MCP transport is starting and background warmup will run alongside it.",
+            storage_path=storage_path,
+        )
         async with stdio_server() as (read_stream, write_stream):
+            startup_task = asyncio.create_task(_run_startup_maintenance(storage_path), name="startup-warmup")
             await server.run(
                 read_stream,
                 write_stream,
                 server.create_initialization_options(),
             )
+    except Exception as exc:
+        try:
+            _write_startup_state(
+                "failed",
+                phase="server_boot",
+                detail=f"{type(exc).__name__}: {exc}",
+                metadata={"storage_path": storage_path or ""},
+            )
+        except Exception:
+            logger.debug("startup failure state write failed", exc_info=True)
+        raise
     finally:
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
         from .storage import IndexStore
         IndexStore(base_path=os.environ.get("CODE_INDEX_PATH")).close()
 
@@ -4021,8 +4118,30 @@ async def run_sse_server(host: str, port: int):
     _log_startup_validation_warnings()
     # Feature 10: Restore session state on startup
     _restore_session_state()
+    storage_path = os.environ.get("CODE_INDEX_PATH")
+    _background_startup_detail(
+        "server_boot",
+        "SSE transport is starting and background warmup will run alongside it.",
+        storage_path=storage_path,
+    )
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
-    await uvicorn.Server(config).serve()
+    startup_task = asyncio.create_task(_run_startup_maintenance(storage_path), name="startup-warmup")
+    try:
+        await uvicorn.Server(config).serve()
+    except Exception as exc:
+        try:
+            _write_startup_state(
+                "failed",
+                phase="server_boot",
+                detail=f"{type(exc).__name__}: {exc}",
+                metadata={"storage_path": storage_path or ""},
+            )
+        except Exception:
+            logger.debug("startup failure state write failed", exc_info=True)
+        raise
+    finally:
+        if not startup_task.done():
+            startup_task.cancel()
 
 
 async def run_streamable_http_server(host: str, port: int):
@@ -4136,8 +4255,30 @@ async def run_streamable_http_server(host: str, port: int):
     _log_startup_validation_warnings()
     # Feature 10: Restore session state on startup
     _restore_session_state()
+    storage_path = os.environ.get("CODE_INDEX_PATH")
+    _background_startup_detail(
+        "server_boot",
+        "Streamable-HTTP transport is starting and background warmup will run alongside it.",
+        storage_path=storage_path,
+    )
     config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
-    await uvicorn.Server(config).serve()
+    startup_task = asyncio.create_task(_run_startup_maintenance(storage_path), name="startup-warmup")
+    try:
+        await uvicorn.Server(config).serve()
+    except Exception as exc:
+        try:
+            _write_startup_state(
+                "failed",
+                phase="server_boot",
+                detail=f"{type(exc).__name__}: {exc}",
+                metadata={"storage_path": storage_path or ""},
+            )
+        except Exception:
+            logger.debug("startup failure state write failed", exc_info=True)
+        raise
+    finally:
+        if not startup_task.done():
+            startup_task.cancel()
 
 
 def _setup_logging(args) -> None:
@@ -5349,21 +5490,6 @@ def main(argv: Optional[list[str]] = None):
         # Re-run load_config() after _setup_logging() so config warnings/errors
         # go to the configured log destination (the early call at startup ran before logging was set up)
         config_module.load_config()
-
-        # Clean up orphan indexes whose source_root no longer exists
-        try:
-            from .storage import IndexStore
-
-            storage_path = os.environ.get("CODE_INDEX_PATH")
-            store = IndexStore(base_path=storage_path)
-            cleaned = store.cleanup_orphan_indexes()
-            store.close()
-            if cleaned:
-                logger.info("Cleaned up %d orphan index(es)", cleaned)
-        except Exception:
-            logger.debug("Orphan index cleanup failed", exc_info=True)
-
-        config_module.load_all_project_configs()
         from .reindex_state import set_freshness_mode
         # Apply config default if --freshness-mode was not explicitly provided
         if args.freshness_mode is None:
